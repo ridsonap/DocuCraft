@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { PageThumbnail } from "@/types/pdf";
 import { api } from "@/lib/api";
+import PageSelectionInput from "./PageSelectionInput";
 import {
   RotateCw,
   Trash2,
@@ -27,6 +28,8 @@ export default function PageOrganizer({ pdfId, onUpdate }: PageOrganizerProps) {
   const [draggedPage, setDraggedPage] = useState<number | null>(null);
   const [actionLoading, setActionLoading] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const [lastClickedPage, setLastClickedPage] = useState<number | null>(null);
+  const [showManualInput, setShowManualInput] = useState(false);
 
   const showNotification = (msg: string) => {
     setMessage(msg);
@@ -53,13 +56,27 @@ export default function PageOrganizer({ pdfId, onUpdate }: PageOrganizerProps) {
   // Selection toggle
   const toggleSelect = (pageNum: number, e: React.MouseEvent) => {
     e.stopPropagation();
-    const newSelected = new Set(selected);
-    if (newSelected.has(pageNum)) {
-      newSelected.delete(pageNum);
+
+    // Range selection with Shift key
+    if (e.shiftKey && lastClickedPage !== null) {
+      const start = Math.min(lastClickedPage, pageNum);
+      const end = Math.max(lastClickedPage, pageNum);
+      const range = new Set(selected);
+      for (let i = start; i <= end; i++) {
+        range.add(i);
+      }
+      setSelected(range);
     } else {
-      newSelected.add(pageNum);
+      // Single toggle (existing behavior)
+      const newSelected = new Set(selected);
+      if (newSelected.has(pageNum)) {
+        newSelected.delete(pageNum);
+      } else {
+        newSelected.add(pageNum);
+      }
+      setSelected(newSelected);
     }
-    setSelected(newSelected);
+    setLastClickedPage(pageNum);
   };
 
   const selectAll = () => {
@@ -68,6 +85,18 @@ export default function PageOrganizer({ pdfId, onUpdate }: PageOrganizerProps) {
     } else {
       setSelected(new Set(pages.map((p) => p.page)));
     }
+  };
+
+  // Select odd pages (1, 3, 5... in 1-based, which is 0, 2, 4... in 0-based)
+  const selectOdd = () => {
+    const oddPages = pages.filter((_, i) => i % 2 === 0).map((p) => p.page);
+    setSelected(new Set(oddPages));
+  };
+
+  // Select even pages (2, 4, 6... in 1-based, which is 1, 3, 5... in 0-based)
+  const selectEven = () => {
+    const evenPages = pages.filter((_, i) => i % 2 === 1).map((p) => p.page);
+    setSelected(new Set(evenPages));
   };
 
   // Drag and drop reorder
@@ -259,14 +288,47 @@ export default function PageOrganizer({ pdfId, onUpdate }: PageOrganizerProps) {
           >
             {selected.size === pages.length ? "Deselect All" : "Select All"}
           </button>
+
+          {/* Selection utility buttons */}
+          <div className="flex items-center gap-1 pl-2 border-l border-gray-300 dark:border-gray-600">
+            <button
+              onClick={selectOdd}
+              className="text-xs font-medium text-gray-600 hover:text-gray-900 hover:bg-gray-100 px-1.5 py-0.5 rounded transition-colors"
+              title="Select odd pages (1, 3, 5...)"
+            >
+              Odd
+            </button>
+            <button
+              onClick={selectEven}
+              className="text-xs font-medium text-gray-600 hover:text-gray-900 hover:bg-gray-100 px-1.5 py-0.5 rounded transition-colors"
+              title="Select even pages (2, 4, 6...)"
+            >
+              Even
+            </button>
+            <button
+              onClick={() => setShowManualInput(true)}
+              className="text-xs font-medium text-gray-600 hover:text-gray-900 hover:bg-gray-100 px-1.5 py-0.5 rounded transition-colors"
+              title="Select by page number"
+            >
+              Pages...
+            </button>
+          </div>
         </div>
 
-        {/* Center Notification */}
-        {message && (
-          <div className="text-xs font-medium text-emerald-700 bg-emerald-50 px-3 py-1 rounded-full border border-emerald-200 animate-in fade-in">
-            {message}
-          </div>
-        )}
+        {/* Center: Manual Input or Notification */}
+        <div className="flex-1 flex justify-center">
+          {showManualInput ? (
+            <PageSelectionInput
+              totalPages={pages.length}
+              onSelect={(selectedPages) => setSelected(new Set(selectedPages))}
+              onClose={() => setShowManualInput(false)}
+            />
+          ) : message ? (
+            <div className="text-xs font-medium text-emerald-700 bg-emerald-50 px-3 py-1 rounded-full border border-emerald-200 animate-in fade-in">
+              {message}
+            </div>
+          ) : null}
+        </div>
 
         {/* Right: Actions */}
         <div className="flex items-center gap-1.5">

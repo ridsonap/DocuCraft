@@ -74,6 +74,14 @@ export const api = {
     );
   },
 
+  // Delete text from page
+  deleteText: async (pdfId: string, payload: import('@/types/pdf').TextDeletePayload) => {
+    return fetchJSON<{ success: boolean; message: string }>(
+      `/api/pdf/${pdfId}/delete-text`,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }
+    );
+  },
+
   // OCR
   detectScannedPages: async (pdfId: string) => {
     return fetchJSON<{ scanned_pages: { page: number; reason: string; image_count: number }[]; total_pages: number }>(

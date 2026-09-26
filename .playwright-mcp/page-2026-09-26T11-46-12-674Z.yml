@@ -1,0 +1,23 @@
+- generic [ref=e2]:
+  - banner [ref=e3]:
+    - generic [ref=e4]: DocuCraftPro
+    - generic [ref=e11]:
+      - text: Unggah PDF
+      - button "Unggah PDF" [ref=e16]
+  - main [ref=e17]:
+    - generic [ref=e18]:
+      - heading "DocuCraft PDF Editor" [level=2] [ref=e24]
+      - paragraph [ref=e25]: Edit teks langsung, atur dan putar halaman, bubuhkan tanda tangan digital, buat catatan, dan scan OCR dalam satu aplikasi web cepat & modern.
+      - generic [ref=e26]:
+        - text: Pilih Dokumen PDF
+        - button "Pilih Dokumen PDF" [ref=e31]
+      - generic [ref=e32]:
+        - generic [ref=e33]:
+          - generic [ref=e34]: ✍️ In-Place Text
+          - generic [ref=e35]: Edit teks asli langsung pada dokumen.
+        - generic [ref=e36]:
+          - generic [ref=e37]: 📑 Atur Halaman
+          - generic [ref=e38]: Drag-drop reorder, putar 90°, hapus.
+        - generic [ref=e39]:
+          - generic [ref=e40]: 🖋️ Tanda Tangan
+          - generic [ref=e41]: Gambar tanda tangan & ekspor vector PDF.

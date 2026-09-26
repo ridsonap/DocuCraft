@@ -50,6 +50,59 @@ def int_to_rgb255(color: Any, default: tuple[int, int, int] = (0, 0, 0)) -> tupl
     return default
 
 
+def find_matching_span(
+    page,
+    old_text: Optional[str],
+    x: float,
+    y: float,
+    width: float = 0.0,
+    height: float = 0.0,
+) -> Optional[dict]:
+    """Find the exact span in page text_dict that matches the target text block.
+    Returns the span dictionary if matched, or None.
+    """
+    text_dict = page.get_text("dict")
+    clean_old = old_text.strip().lower() if old_text else ""
+    best_span = None
+    best_score = -1
+
+    for block in text_dict.get("blocks", []):
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                span_text = span.get("text", "").strip().lower()
+                bbox = span.get("bbox", [0, 0, 0, 0])
+                sx, sy = bbox[0], bbox[1]
+                dist = (sx - x) ** 2 + (sy - y) ** 2
+
+                score = 0
+                if dist < 4:
+                    score += 50
+                elif dist < 25:
+                    score += 30
+                elif dist < 400:
+                    score += 10
+
+                if clean_old:
+                    if span_text == clean_old:
+                        score += 50
+                    elif clean_old in span_text or span_text in clean_old:
+                        score += 30
+                    else:
+                        words_old = set(clean_old.split())
+                        words_span = set(span_text.split())
+                        overlap = words_old & words_span
+                        if overlap:
+                            score += len(overlap) * 10
+
+                if score > best_score:
+                    best_score = score
+                    best_span = span
+
+    return best_span if best_score >= 20 else None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ANNOTATION MODELS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -201,13 +254,30 @@ async def extract_text(pdf_id: str, page: Optional[int] = Query(None)) -> dict:
                     if not span_text.strip():
                         continue
                     bbox = span.get("bbox", [0, 0, 0, 0])
+                    font_raw = span.get("font", "helv")
+                    flags = span.get("flags", 0)
+                    font_lower = font_raw.lower()
+
+                    is_bold = "bold" in font_lower or "black" in font_lower or "heavy" in font_lower or bool(flags & 16)
+                    is_italic = "italic" in font_lower or "oblique" in font_lower or "slant" in font_lower or bool(flags & 2)
+                    is_mono = "courier" in font_lower or "mono" in font_lower or "consolas" in font_lower or "menlo" in font_lower or bool(flags & 8)
+                    is_serif = not is_mono and ("times" in font_lower or "serif" in font_lower or "georgia" in font_lower or "cambria" in font_lower or "garamond" in font_lower or bool(flags & 4))
+
+                    font_family = "mono" if is_mono else ("serif" if is_serif else "sans")
+
+                    origin = span.get("origin", (bbox[0], bbox[3]))
                     blocks.append({
                         "text": span_text,
                         "x": round(bbox[0], 2),
                         "y": round(bbox[1], 2),
                         "width": round(bbox[2] - bbox[0], 2),
                         "height": round(bbox[3] - bbox[1], 2),
-                        "font_name": span.get("font", "helv"),
+                        "origin_x": round(origin[0], 2),
+                        "origin_y": round(origin[1], 2),
+                        "font_name": font_raw,
+                        "font_family": font_family,
+                        "is_bold": is_bold,
+                        "is_italic": is_italic,
                         "font_size": round(span.get("size", 11), 1),
                         "color": int_to_rgb255(span.get("color", 0)),
                         "page": page_num,
@@ -221,6 +291,52 @@ async def extract_text(pdf_id: str, page: Optional[int] = Query(None)) -> dict:
 # IN-PLACE TEXT EDITING & ADDING
 # ─────────────────────────────────────────────────────────────────────────────
 
+def resolve_pdf_font_name(
+    font_name: Optional[str] = None,
+    font_family: Optional[str] = None,
+    is_bold: Optional[bool] = None,
+    is_italic: Optional[bool] = None,
+) -> str:
+    name = (font_name or "").lower()
+    family = (font_family or "").lower()
+
+    if not family:
+        if "courier" in name or "mono" in name or "consolas" in name:
+            family = "mono"
+        elif "times" in name or "serif" in name or "georgia" in name or "cambria" in name or "garamond" in name:
+            family = "serif"
+        else:
+            family = "sans"
+
+    bold = is_bold if is_bold is not None else ("bold" in name or "black" in name or "heavy" in name)
+    italic = is_italic if is_italic is not None else ("italic" in name or "oblique" in name or "slant" in name)
+
+    if family == "mono":
+        if bold and italic:
+            return "courier-boldoblique"
+        if bold:
+            return "courier-bold"
+        if italic:
+            return "courier-oblique"
+        return "courier"
+    elif family == "serif":
+        if bold and italic:
+            return "times-bolditalic"
+        if bold:
+            return "times-bold"
+        if italic:
+            return "times-italic"
+        return "times-roman"
+    else:  # sans
+        if bold and italic:
+            return "hebi"
+        if bold:
+            return "hebo"
+        if italic:
+            return "heit"
+        return "helv"
+
+
 class TextEditRequest(PydanticBaseModel):
     page: int
     x: float
@@ -231,7 +347,17 @@ class TextEditRequest(PydanticBaseModel):
     new_text: str
     font_size: Optional[float] = None
     font_name: Optional[str] = None
+    font_family: Optional[str] = None
+    is_bold: Optional[bool] = None
+    is_italic: Optional[bool] = None
     color: Optional[tuple[int, int, int]] = None
+    bg_color: Optional[tuple[int, int, int]] = None
+    orig_x: Optional[float] = None
+    orig_y: Optional[float] = None
+    orig_width: Optional[float] = None
+    orig_height: Optional[float] = None
+    origin_x: Optional[float] = None
+    origin_y: Optional[float] = None
 
 
 class TextAddRequest(PydanticBaseModel):
@@ -241,11 +367,25 @@ class TextAddRequest(PydanticBaseModel):
     text: str
     font_size: Optional[float] = 12.0
     font_name: Optional[str] = "helv"
+    font_family: Optional[str] = None
+    is_bold: Optional[bool] = None
+    is_italic: Optional[bool] = None
     color: Optional[tuple[int, int, int]] = (0, 0, 0)
+    bg_color: Optional[tuple[int, int, int]] = None
 
 
-@router.post("/{pdf_id}/edit-text")
-async def edit_text(pdf_id: str, request: TextEditRequest) -> dict:
+class TextDeleteRequest(PydanticBaseModel):
+    page: int
+    x: float
+    y: float
+    width: float
+    height: float
+    old_text: str = ""
+
+
+@router.post("/{pdf_id}/delete-text")
+async def delete_text(pdf_id: str, request: TextDeleteRequest) -> dict:
+    """Remove text from the PDF cleanly without leaving any box or touching table lines."""
     if pdf_id not in PDF_STORAGE:
         raise HTTPException(status_code=404, detail="PDF not found")
 
@@ -260,35 +400,130 @@ async def edit_text(pdf_id: str, request: TextEditRequest) -> dict:
 
     page = doc[request.page]
 
-    # Calculate bounding box for redaction
-    rect = fitz.Rect(
-        request.x - 0.5,
-        request.y - 0.5,
-        request.x + max(request.width, 10) + 0.5,
-        request.y + max(request.height, 8) + 0.5,
+    matching_span = find_matching_span(
+        page,
+        request.old_text,
+        request.x,
+        request.y,
+        request.width,
+        request.height,
     )
 
-    font_size = request.font_size if request.font_size and request.font_size > 0 else 11.0
-    font_map = {
-        "times": "times-roman",
-        "times-roman": "times-roman",
-        "arial": "helv",
-        "helvetica": "helv",
-        "courier": "courier",
-    }
-    font_name = font_map.get((request.font_name or "").lower(), "helv")
-    text_color = normalize_color(request.color, default=(0.0, 0.0, 0.0))
+    if matching_span:
+        rect = fitz.Rect(matching_span["bbox"])
+    else:
+        rect = fitz.Rect(request.x, request.y, request.x + max(request.width, 10.0), request.y + max(request.height, 8.0))
 
     try:
-        page.add_redact_annot(
-            rect,
-            fill=(1.0, 1.0, 1.0),
-            text=request.new_text,
+        # fill=False removes vector text glyphs without painting any rectangle
+        page.add_redact_annot(rect, fill=False)
+        page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE, graphics=0)
+
+        output = io.BytesIO()
+        doc.save(output, garbage=3, deflate=True)
+        PDF_STORAGE[pdf_id] = output.getvalue()
+        if pdf_id in PDF_METADATA:
+            PDF_METADATA[pdf_id]["size"] = len(PDF_STORAGE[pdf_id])
+    except Exception as e:
+        doc.close()
+        raise HTTPException(status_code=500, detail=f"Failed to delete text: {str(e)}")
+
+    doc.close()
+    return {"success": True, "message": "Text deleted successfully"}
+
+
+@router.post("/{pdf_id}/edit-text")
+async def edit_text(pdf_id: str, request: TextEditRequest) -> dict:
+    """Edit text in place: cleanly removes old text and inserts replacement at the exact baseline."""
+    if pdf_id not in PDF_STORAGE:
+        raise HTTPException(status_code=404, detail="PDF not found")
+
+    try:
+        doc = fitz.open(stream=PDF_STORAGE[pdf_id], filetype="pdf")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to open PDF: {str(e)}")
+
+    if request.page < 0 or request.page >= len(doc):
+        doc.close()
+        raise HTTPException(status_code=400, detail=f"Page {request.page + 1} out of range (1-{len(doc)})")
+
+    page = doc[request.page]
+
+    # Find the matching text span in the PDF to get exact bbox and origin baseline
+    search_x = request.orig_x if request.orig_x is not None else request.x
+    search_y = request.orig_y if request.orig_y is not None else request.y
+    search_w = request.orig_width if request.orig_width is not None else request.width
+    search_h = request.orig_height if request.orig_height is not None else request.height
+
+    matching_span = find_matching_span(
+        page,
+        request.old_text,
+        search_x,
+        search_y,
+        search_w,
+        search_h,
+    )
+
+    if matching_span:
+        orig_bbox = fitz.Rect(matching_span["bbox"])
+        orig_baseline_y = matching_span["origin"][1]
+        orig_anchor_x = matching_span["bbox"][0]
+        orig_anchor_y = matching_span["bbox"][1]
+        span_font = matching_span["font"]
+        span_size = matching_span["size"]
+        span_color = matching_span.get("color")
+    else:
+        orig_bbox = fitz.Rect(search_x, search_y, search_x + max(search_w, 10.0), search_y + max(search_h, 8.0))
+        orig_baseline_y = request.origin_y if request.origin_y is not None else (search_y + (request.font_size or 11.0) * 0.82)
+        orig_anchor_x = search_x
+        orig_anchor_y = search_y
+        span_font = None
+        span_size = None
+        span_color = None
+
+    # Redact the old text.
+    # If bg_color is explicitly provided by the user, fill with that color.
+    # If bg_color is None (transparent / default), fill=False so NO white box is drawn!
+    redact_fill = normalize_color(request.bg_color) if request.bg_color is not None else False
+    page.add_redact_annot(orig_bbox, fill=redact_fill)
+    page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE, graphics=0)
+
+    # Calculate target text insertion position
+    dx = request.x - orig_anchor_x
+    dy = request.y - orig_anchor_y
+    target_x = orig_anchor_x + dx
+    target_baseline_y = orig_baseline_y + dy
+
+    font_size = request.font_size if request.font_size and request.font_size > 0 else (span_size or 11.0)
+    font_name = resolve_pdf_font_name(
+        request.font_name or span_font,
+        request.font_family,
+        request.is_bold,
+        request.is_italic,
+    )
+    text_color = normalize_color(
+        request.color,
+        default=normalize_color(span_color) if span_color is not None else (0.0, 0.0, 0.0)
+    )
+
+    try:
+        # If user explicitly requested an opaque background, draw the rect before inserting text
+        if request.bg_color is not None:
+            bg_norm = normalize_color(request.bg_color)
+            f_size = font_size
+            text_w = max(len(request.new_text) * f_size * 0.6, request.width)
+            bg_rect = fitz.Rect(target_x, target_baseline_y - f_size * 0.85, target_x + text_w, target_baseline_y + f_size * 0.25)
+            page.draw_rect(bg_rect, color=None, fill=bg_norm)
+
+        # Insert replacement text at the exact baseline!
+        insert_point = fitz.Point(target_x, target_baseline_y)
+        page.insert_text(
+            insert_point,
+            request.new_text,
             fontname=font_name,
             fontsize=font_size,
-            text_color=text_color,
+            color=text_color,
         )
-        page.apply_redactions()
 
         output = io.BytesIO()
         doc.save(output, garbage=3, deflate=True)
@@ -318,15 +553,28 @@ async def add_text(pdf_id: str, request: TextAddRequest) -> dict:
         raise HTTPException(status_code=400, detail=f"Page {request.page + 1} out of range")
 
     page = doc[request.page]
+    font_name = resolve_pdf_font_name(
+        request.font_name,
+        request.font_family,
+        request.is_bold,
+        request.is_italic,
+    )
     text_color = normalize_color(request.color, default=(0.0, 0.0, 0.0))
 
     try:
+        if request.bg_color is not None:
+            bg_norm = normalize_color(request.bg_color)
+            f_size = request.font_size or 12.0
+            text_w = max(len(request.text) * f_size * 0.6, 20.0)
+            bg_rect = fitz.Rect(request.x, request.y - f_size, request.x + text_w, request.y + 4)
+            page.draw_rect(bg_rect, color=None, fill=bg_norm)
+
         point = fitz.Point(request.x, request.y)
         page.insert_text(
             point,
             request.text,
             fontsize=request.font_size or 12.0,
-            fontname=request.font_name or "helv",
+            fontname=font_name,
             color=text_color,
         )
         output = io.BytesIO()

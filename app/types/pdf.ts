@@ -6,10 +6,15 @@ export interface TextBlock {
   y: number;
   width: number;
   height: number;
+  origin_x?: number;
+  origin_y?: number;
   font_name: string;
   font_size: number;
   color: [number, number, number]; // RGB 0-255
   page: number;
+  font_family?: "sans" | "serif" | "mono";
+  is_bold?: boolean;
+  is_italic?: boolean;
 }
 
 export interface PageThumbnail {
@@ -52,7 +57,17 @@ export interface TextEditPayload {
   new_text: string;
   font_size?: number;
   font_name?: string;
+  font_family?: "sans" | "serif" | "mono";
+  is_bold?: boolean;
+  is_italic?: boolean;
   color?: [number, number, number];
+  bg_color?: [number, number, number] | null;
+  orig_x?: number;
+  orig_y?: number;
+  orig_width?: number;
+  orig_height?: number;
+  origin_x?: number;
+  origin_y?: number;
 }
 
 export interface TextAddPayload {
@@ -62,7 +77,20 @@ export interface TextAddPayload {
   text: string;
   font_size?: number;
   font_name?: string;
+  font_family?: "sans" | "serif" | "mono";
+  is_bold?: boolean;
+  is_italic?: boolean;
   color?: [number, number, number];
+  bg_color?: [number, number, number] | null;
+}
+
+export interface TextDeletePayload {
+  page: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  old_text: string;
 }
 
 export interface PDFPageRenderProps {
