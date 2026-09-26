@@ -1,0 +1,55 @@
+# All-in-One Dockerfile for single-container deployments (Railway, Render, Fly.io, Cloud Run)
+FROM node:20-bookworm-slim AS frontend-builder
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY . .
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV NODE_ENV=production
+RUN npm run build
+
+FROM python:3.11-slim-bookworm
+WORKDIR /app
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+
+# Install Node.js, Tesseract OCR, Poppler, curl
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    tesseract-ocr \
+    tesseract-ocr-eng \
+    tesseract-ocr-ind \
+    poppler-utils \
+    libgl1 \
+    libglib2.0-0 \
+    ca-certificates \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python backend dependencies
+COPY backend/requirements.txt ./backend/
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r ./backend/requirements.txt
+
+# Copy Backend code
+COPY backend ./backend/
+
+# Copy Frontend standalone build from builder
+COPY --from=frontend-builder /app/public ./public
+COPY --from=frontend-builder /app/.next/standalone ./
+COPY --from=frontend-builder /app/.next/static ./.next/static
+
+# Copy startup script
+COPY start.sh .
+RUN chmod +x start.sh
+
+EXPOSE 3000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:3000/ || exit 1
+
+CMD ["./start.sh"]
