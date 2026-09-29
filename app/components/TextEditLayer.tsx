@@ -22,6 +22,9 @@ interface EditingState {
   y: number;
   width: number;
   height: number;
+  // Baseline anchor offset (PDF points) so the editor aligns to the text baseline
+  anchorDx: number;
+  anchorDy: number;
   originalText: string;
   fontSize: number;
   fontName: string;
@@ -176,6 +179,14 @@ export default function TextEditLayer({
     const initialWidth = Math.max(block.width, 50);
     const initialHeight = Math.max(block.height, 22);
 
+    // Anchor the editor to the text baseline: position the editor box so that
+    // the CSS baseline of the textarea lands exactly on origin_y.
+    const rawSize = block.font_size || 12;
+    const fontSize1dp = Math.round(rawSize * 10) / 10;
+    const ascent = rawSize * 0.8;
+    const anchorDx = (block.origin_x ?? block.x) - block.x;
+    const anchorDy = (block.origin_y ?? block.y) - block.y - ascent;
+
     setEditing({
       isNew: false,
       block,
@@ -183,8 +194,10 @@ export default function TextEditLayer({
       y: block.y,
       width: initialWidth,
       height: initialHeight,
+      anchorDx,
+      anchorDy,
       originalText: block.text,
-      fontSize: Math.round(block.font_size || 12),
+      fontSize: fontSize1dp,
       fontName: block.font_name || "helv",
       fontFamily: detectedFamily,
       isBold: detectedBold,
@@ -194,7 +207,7 @@ export default function TextEditLayer({
     });
 
     setTextValue(block.text);
-    setFontSize(Math.round(block.font_size || 12));
+    setFontSize(fontSize1dp);
     setFontFamily(detectedFamily);
     setIsBold(detectedBold);
     setIsItalic(detectedItalic);
@@ -225,6 +238,8 @@ export default function TextEditLayer({
       y: Math.round(clickY),
       width: 180,
       height: 40,
+      anchorDx: 0,
+      anchorDy: 0,
       originalText: "",
       fontSize: 14,
       fontName: "helv",
@@ -699,12 +714,16 @@ export default function TextEditLayer({
             onClick={(e) => e.stopPropagation()}
             className="absolute z-40 select-none"
             style={{
-              left: `${editing.x * scale}px`,
-              top: `${editing.y * scale}px`,
+              left: `${(editing.x + (editing.anchorDx || 0)) * scale}px`,
+              top: `${(editing.y + (editing.anchorDy || 0)) * scale}px`,
               width: `${editing.width * scale}px`,
               height: `${editing.height * scale}px`,
             }}
           >
+            {/* Opaque cover: hides original glyphs behind the editor while typing.
+                Only for existing blocks; save semantics (transparent/white bg) unchanged. */}
+            {!editing.isNew && <div className="absolute inset-0 bg-white" aria-hidden />}
+
             {/* Move Handle - Top Center */}
             <div
               className="absolute -top-6 left-1/2 -translate-x-1/2 cursor-grab active:cursor-grabbing bg-blue-600 text-white px-2 py-0.5 rounded text-[11px] font-medium flex items-center gap-1 hover:bg-blue-700 shadow-md z-50 whitespace-nowrap touch-none"
@@ -729,13 +748,15 @@ export default function TextEditLayer({
                 onKeyDown={handleKeyDown}
                 onClick={(e) => e.stopPropagation()}
                 placeholder="Ketik teks di sini..."
-                className="w-full h-full p-1 text-sm bg-transparent resize-none outline-none leading-snug"
+                className="w-full h-full bg-transparent resize-none outline-none"
                 style={{
                   fontSize: `${fontSize * scale}px`,
                   fontFamily: getCssFontFamily(fontFamily),
                   fontWeight: isBold ? 700 : 400,
                   fontStyle: isItalic ? "italic" : "normal",
                   color: getColorStyle(selectedColor),
+                  padding: 0,
+                  lineHeight: 1,
                 }}
               />
             </div>

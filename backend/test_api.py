@@ -538,3 +538,95 @@ if __name__ == "__main__":
     test_page_numbers()
     test_protect_and_unlock()
     test_bugfix_regressions()
+    test_edit_text_redaction_precise()
+    test_edit_text_on_rotated_page()
+
+
+def _download_doc(pdf_id: str):
+    res = client.get(f"/api/pdf/{pdf_id}/download")
+    assert res.status_code == 200, res.text
+    return fitz.open(stream=res.content, filetype="pdf")
+
+
+def test_edit_text_redaction_precise():
+    """(a) edit-text must fully remove old text; (b) new text lands at the right spot."""
+    doc = fitz.open()
+    page = doc.new_page(width=600, height=800)
+    page.insert_text((50, 100), "Alpha Bravo Charlie", fontsize=12)
+    page.insert_text((50, 130), "Delta Echo Foxtrot", fontsize=12)
+    pdf_bytes = doc.tobytes()
+    doc.close()
+    pdf_id = upload(pdf_bytes, "redact_test.pdf")
+
+    res = client.get(f"/api/pdf/{pdf_id}/extract-text?page=0")
+    assert res.status_code == 200, res.text
+    blocks = res.json()["blocks"]
+    target = next(b for b in blocks if "Alpha Bravo" in b["text"])
+
+    edit_payload = {
+        "page": 0,
+        "x": target["x"], "y": target["y"],
+        "width": target["width"], "height": target["height"],
+        "old_text": target["text"],
+        "new_text": "REPLACED",
+        "font_size": 12.0, "font_name": "helv",
+        "color": [0, 0, 0],
+        "origin_x": target.get("origin_x"), "origin_y": target.get("origin_y"),
+    }
+    res = client.post(f"/api/pdf/{pdf_id}/edit-text", json=edit_payload)
+    assert res.status_code == 200, res.text
+
+    doc2 = _download_doc(pdf_id)
+    # (a) old text fully gone (redaction covered even edge glyphs)
+    assert doc2[0].search_for("Alpha Bravo Charlie") == [], "old text still present after edit"
+    # other line untouched
+    assert doc2[0].search_for("Delta Echo Foxtrot") != []
+    # (b) new text exists near the original unrotated position
+    hits = doc2[0].search_for("REPLACED")
+    assert len(hits) == 1, f"expected 1 hit for new text, got {len(hits)}"
+    hx = (hits[0].x0 + hits[0].x1) / 2
+    hy = (hits[0].y0 + hits[0].y1) / 2
+    ox = target["origin_x"] if target.get("origin_x") is not None else target["x"]
+    oy = target["origin_y"] if target.get("origin_y") is not None else target["y"]
+    assert abs(hx - (ox + 20)) < 30, f"new text x off: {hx} vs origin {ox}"
+    assert abs(hy - oy) < 15, f"new text baseline y off: {hy} vs origin {oy}"
+    doc2.close()
+    print("✓ edit-text redaction precise: old text gone, new text at correct position")
+
+
+def test_edit_text_on_rotated_page():
+    """(c) edit on a 90°-rotated page removes the right text (display-frame coords)."""
+    doc = fitz.open()
+    page = doc.new_page(width=600, height=800)
+    page.insert_text((50, 100), "Rotated Target Text", fontsize=12)
+    page.insert_text((50, 150), "Rotated Other Line", fontsize=12)
+    page.set_rotation(90)
+    pdf_bytes = doc.tobytes()
+    doc.close()
+    pdf_id = upload(pdf_bytes, "rotated_test.pdf")
+
+    res = client.get(f"/api/pdf/{pdf_id}/extract-text?page=0")
+    assert res.status_code == 200, res.text
+    blocks = res.json()["blocks"]
+    target = next(b for b in blocks if "Target" in b["text"])
+    # display frame on 90° rotation: page is 800 wide x 600 tall; coords must differ from unrotated
+    assert target["x"] > 600, f"expected display coords, got x={target['x']}"
+
+    edit_payload = {
+        "page": 0,
+        "x": target["x"], "y": target["y"],
+        "width": target["width"], "height": target["height"],
+        "old_text": target["text"],
+        "new_text": "ROTATED OK",
+        "font_size": 12.0, "font_name": "helv",
+        "color": [0, 0, 0],
+    }
+    res = client.post(f"/api/pdf/{pdf_id}/edit-text", json=edit_payload)
+    assert res.status_code == 200, res.text
+
+    doc2 = _download_doc(pdf_id)
+    assert doc2[0].search_for("Rotated Target Text") == [], "old text still present on rotated page"
+    assert doc2[0].search_for("Rotated Other Line") != [], "wrong span redacted on rotated page"
+    assert len(doc2[0].search_for("ROTATED OK")) == 1
+    doc2.close()
+    print("✓ edit-text on rotated page: correct text removed, new text placed")
