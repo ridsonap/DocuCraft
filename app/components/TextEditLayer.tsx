@@ -720,10 +720,6 @@ export default function TextEditLayer({
               height: `${editing.height * scale}px`,
             }}
           >
-            {/* Opaque cover: hides original glyphs behind the editor while typing.
-                Only for existing blocks; save semantics (transparent/white bg) unchanged. */}
-            {!editing.isNew && <div className="absolute inset-0 bg-white" aria-hidden />}
-
             {/* Move Handle - Top Center */}
             <div
               className="absolute -top-6 left-1/2 -translate-x-1/2 cursor-grab active:cursor-grabbing bg-blue-600 text-white px-2 py-0.5 rounded text-[11px] font-medium flex items-center gap-1 hover:bg-blue-700 shadow-md z-50 whitespace-nowrap touch-none"
@@ -735,10 +731,12 @@ export default function TextEditLayer({
               <span>Pindah</span>
             </div>
 
-            {/* Textarea container with transparent background */}
+            {/* Textarea container: opaque white when editing existing text
+                so the original glyphs can't ghost through while typing.
+                (Save-time Transparan/Putih choice still applies to the PDF.) */}
             <div
               className={`w-full h-full border-2 border-blue-500 rounded-xs transition-colors ${
-                isTransparentBg ? "bg-transparent" : "bg-white shadow-sm"
+                !editing.isNew || !isTransparentBg ? "bg-white shadow-sm" : "bg-transparent"
               }`}
             >
               <textarea
