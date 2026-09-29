@@ -9,7 +9,7 @@ import {
   TextBoxAnnotation,
   HighlightAnnotation,
   StickyNoteAnnotation,
-  StampAnnotation,
+  ImageAnnotation,
   FreehandAnnotation,
 } from "@/types/annotation";
 import { api } from "@/lib/api";
@@ -39,8 +39,10 @@ export default function AnnotationLayer({
   const [isDrawing, setIsDrawing] = useState(false);
   const [dragStart, setDragStart] = useState<{ x: number; y: number } | null>(null);
   const [dragCurrent, setDragCurrent] = useState<{ x: number; y: number } | null>(null);
+  const [pendingImagePos, setPendingImagePos] = useState<{ x: number; y: number } | null>(null);
 
   const svgRef = useRef<SVGSVGElement>(null);
+  const imageInputRef = useRef<HTMLInputElement>(null);
 
   // Ref mirror so memoized handlers always see the latest annotations
   // (avoids the stale-closure bug where adding a 2nd annotation dropped the 1st)
@@ -111,17 +113,6 @@ export default function AnnotationLayer({
             color: "yellow",
           };
           break;
-        case AnnotationType.STAMP:
-          payload = {
-            ...payload,
-            x: Math.round(x),
-            y: Math.round(y),
-            width: 140,
-            height: 45,
-            text: "APPROVED",
-            color: rgb[0] === 0 && rgb[1] === 0 && rgb[2] === 0 ? [220, 38, 38] : rgb,
-          };
-          break;
         case AnnotationType.HIGHLIGHT:
           payload = {
             ...payload,
@@ -130,6 +121,16 @@ export default function AnnotationLayer({
             width: Math.round(customData?.width || 120),
             height: Math.round(customData?.height || 20),
             color: [250, 204, 21], // Yellow
+          };
+          break;
+        case AnnotationType.IMAGE:
+          payload = {
+            ...payload,
+            x: Math.round(x),
+            y: Math.round(y),
+            width: Math.round(customData?.width || 200),
+            height: Math.round(customData?.height || 150),
+            data_url: customData?.data_url || "",
           };
           break;
       }
@@ -151,6 +152,10 @@ export default function AnnotationLayer({
   const handleMouseDown = useCallback(
     (e: React.MouseEvent) => {
       if (!activeTool) return;
+      // Ignore clicks on existing annotations (e.g. their delete/edit buttons):
+      // mousedown fires before click, so without this guard clicking "delete"
+      // would first spawn a brand-new annotation of the active tool.
+      if ((e.target as Element).closest?.("[data-annot]")) return;
       const coords = getCoordinates(e);
       if (!coords) return;
 
@@ -160,10 +165,12 @@ export default function AnnotationLayer({
       } else if (activeTool === AnnotationType.HIGHLIGHT) {
         setDragStart(coords);
         setDragCurrent(coords);
+      } else if (activeTool === AnnotationType.IMAGE) {
+        setPendingImagePos(coords);
+        imageInputRef.current?.click();
       } else if (
         activeTool === AnnotationType.TEXT_BOX ||
-        activeTool === AnnotationType.STICKY_NOTE ||
-        activeTool === AnnotationType.STAMP
+        activeTool === AnnotationType.STICKY_NOTE
       ) {
         // Immediate placement at click point
         createAnnotation(activeTool, coords.x, coords.y);
@@ -207,6 +214,38 @@ export default function AnnotationLayer({
     setDragCurrent(null);
   }, [isDrawing, drawingPoints, dragStart, dragCurrent, activeTool, createAnnotation]);
 
+  const handleImageFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file || !pendingImagePos) return;
+
+    const pos = pendingImagePos;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = reader.result as string;
+      const img = new Image();
+      const place = (w: number, h: number) => {
+        createAnnotation(AnnotationType.IMAGE, pos.x, pos.y, {
+          width: w,
+          height: h,
+          data_url: dataUrl,
+        });
+        setPendingImagePos(null);
+      };
+      img.onload = () => {
+        const aspect =
+          img.naturalWidth > 0 && img.naturalHeight > 0
+            ? img.naturalWidth / img.naturalHeight
+            : 4 / 3;
+        const width = 200;
+        place(width, Math.round(width / aspect));
+      };
+      img.onerror = () => place(200, 150);
+      img.src = dataUrl;
+    };
+    reader.readAsDataURL(file);
+  };
+
   const handleDelete = async (id: string, e?: React.MouseEvent) => {
     e?.stopPropagation();
     try {
@@ -243,6 +282,7 @@ export default function AnnotationLayer({
   };
 
   return (
+    <>
     <svg
       ref={svgRef}
       className={`absolute inset-0 w-full h-full select-none ${
@@ -260,28 +300,36 @@ export default function AnnotationLayer({
         if (annot.type === AnnotationType.FREEHAND) {
           const fh = annot as FreehandAnnotation;
           const stroke = fh.stroke_color ? `rgb(${fh.stroke_color.join(",")})` : "#000";
-          const pathData = fh.points
-            .map((p, i) => `${i === 0 ? "M" : "L"} ${p.x * scale} ${p.y * scale}`)
-            .join(" ");
+          const strokeLists =
+            fh.strokes && fh.strokes.length > 0 ? fh.strokes : [fh.points || []];
+          const firstPoint = strokeLists[0]?.[0];
 
           return (
-            <g key={annot.id} className="group pointer-events-auto">
-              <path
-                d={pathData}
-                stroke={stroke}
-                strokeWidth={(fh.stroke_width || 2) * scale}
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                fill="none"
-                opacity={fh.opacity || 1}
-                className="cursor-pointer"
-              />
+            <g key={annot.id} className="group pointer-events-auto" data-annot="true">
+              {strokeLists.map(
+                (pts, i) =>
+                  pts.length >= 2 && (
+                    <path
+                      key={i}
+                      d={pts
+                        .map((p, j) => `${j === 0 ? "M" : "L"} ${p.x * scale} ${p.y * scale}`)
+                        .join(" ")}
+                      stroke={stroke}
+                      strokeWidth={(fh.stroke_width || 2) * scale}
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      fill="none"
+                      opacity={fh.opacity || 1}
+                      className="cursor-pointer"
+                    />
+                  )
+              )}
               {/* Delete button at first point on hover */}
-              {fh.points[0] && (
+              {firstPoint && (
                 <circle
-                  cx={fh.points[0].x * scale}
-                  cy={fh.points[0].y * scale}
-                  r={8}
+                  cx={firstPoint.x * scale}
+                  cy={firstPoint.y * scale}
+                  r={14}
                   fill="#ef4444"
                   onClick={(e) => handleDelete(annot.id, e as any)}
                   className="opacity-0 group-hover:opacity-100 cursor-pointer transition-opacity"
@@ -296,7 +344,7 @@ export default function AnnotationLayer({
           const fill = hl.color ? `rgba(${hl.color.join(",")}, 0.35)` : "rgba(250, 204, 21, 0.35)";
 
           return (
-            <g key={annot.id} className="group pointer-events-auto">
+            <g key={annot.id} className="group pointer-events-auto" data-annot="true">
               <rect
                 x={hl.x * scale}
                 y={hl.y * scale}
@@ -322,6 +370,7 @@ export default function AnnotationLayer({
               width={Math.max(tb.width * scale, 120)}
               height={Math.max(tb.height * scale, 50)}
               className="pointer-events-auto overflow-visible"
+              data-annot="true"
             >
               <div
                 onDoubleClick={(e) => handleStartEdit(annot, e)}
@@ -361,17 +410,17 @@ export default function AnnotationLayer({
                     <div className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 flex items-center gap-1 transition-opacity">
                       <button
                         onClick={(e) => handleStartEdit(annot, e)}
-                        className="p-1 bg-blue-50 text-blue-600 rounded hover:bg-blue-100"
+                        className="p-2 bg-blue-50 text-blue-600 rounded hover:bg-blue-100"
                         title="Edit Text"
                       >
-                        <Edit3 size={11} />
+                        <Edit3 size={14} />
                       </button>
                       <button
                         onClick={(e) => handleDelete(annot.id, e)}
-                        className="p-1 bg-red-50 text-red-600 rounded hover:bg-red-100"
+                        className="p-2 bg-red-50 text-red-600 rounded hover:bg-red-100"
                         title="Delete"
                       >
-                        <Trash2 size={11} />
+                        <Trash2 size={14} />
                       </button>
                     </div>
                   </>
@@ -391,6 +440,7 @@ export default function AnnotationLayer({
               width={220}
               height={120}
               className="pointer-events-auto overflow-visible"
+              data-annot="true"
             >
               <div className="group relative">
                 <div
@@ -432,10 +482,10 @@ export default function AnnotationLayer({
                       <span className="text-gray-800 break-words">{note.text || "Click to add comment..."}</span>
                       <button
                         onClick={(e) => handleDelete(annot.id, e)}
-                        className="text-red-500 hover:text-red-700 p-0.5"
+                        className="text-red-500 hover:text-red-700 p-2"
                         title="Delete note"
                       >
-                        <X size={12} />
+                        <X size={14} />
                       </button>
                     </div>
                   )}
@@ -445,39 +495,24 @@ export default function AnnotationLayer({
           );
         }
 
-        if (annot.type === AnnotationType.STAMP) {
-          const stamp = annot as StampAnnotation;
-          const stampColor = stamp.color ? `rgb(${stamp.color.join(",")})` : "#dc2626";
+        if (annot.type === AnnotationType.IMAGE) {
+          const im = annot as ImageAnnotation;
 
           return (
-            <g key={annot.id} className="group pointer-events-auto cursor-pointer">
-              <rect
-                x={stamp.x * scale}
-                y={stamp.y * scale}
-                width={stamp.width * scale}
-                height={stamp.height * scale}
-                fill={stampColor}
-                rx={4}
-                className="opacity-90 shadow-md hover:opacity-100 transition-opacity"
+            <g key={annot.id} className="group pointer-events-auto" data-annot="true">
+              <image
+                href={im.data_url}
+                x={im.x * scale}
+                y={im.y * scale}
+                width={im.width * scale}
+                height={im.height * scale}
               />
-              <text
-                x={(stamp.x + stamp.width / 2) * scale}
-                y={(stamp.y + stamp.height / 2 + 5) * scale}
-                textAnchor="middle"
-                fill="#ffffff"
-                fontSize={15 * scale}
-                fontWeight="bold"
-                letterSpacing="1px"
-              >
-                {stamp.text}
-              </text>
+              {/* Delete button at top-right corner on hover */}
               <circle
-                cx={(stamp.x + stamp.width) * scale}
-                cy={stamp.y * scale}
-                r={9}
-                fill="#dc2626"
-                stroke="#fff"
-                strokeWidth={1.5}
+                cx={(im.x + im.width) * scale}
+                cy={im.y * scale}
+                r={14}
+                fill="#ef4444"
                 onClick={(e) => handleDelete(annot.id, e as any)}
                 className="opacity-0 group-hover:opacity-100 cursor-pointer transition-opacity"
               />
@@ -514,5 +549,14 @@ export default function AnnotationLayer({
         />
       )}
     </svg>
+    {/* Hidden file picker for the Image tool */}
+    <input
+      ref={imageInputRef}
+      type="file"
+      accept="image/*"
+      className="hidden"
+      onChange={handleImageFile}
+    />
+    </>
   );
 }

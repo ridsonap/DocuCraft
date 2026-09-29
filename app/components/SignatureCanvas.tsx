@@ -9,7 +9,7 @@ interface Point {
 }
 
 interface SignatureCanvasProps {
-  onSave: (points: Point[], imageDataUrl?: string) => void;
+  onSave: (strokes: Point[][], imageDataUrl?: string) => void;
   onCancel: () => void;
   width?: number;
   height?: number;
@@ -27,11 +27,12 @@ export default function SignatureCanvas({
 }: SignatureCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [isDrawing, setIsDrawing] = useState(false);
-  const [points, setPoints] = useState<Point[]>([]);
-  const [hasDrawn, setHasDrawn] = useState(false);
+  const [strokes, setStrokes] = useState<Point[][]>([]);
 
-  // Draw existing points
-  const redraw = useCallback((pts: Point[]) => {
+  const hasDrawn = strokes.length > 0;
+
+  // Draw all strokes
+  const redraw = useCallback((allStrokes: Point[][]) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
@@ -40,25 +41,26 @@ export default function SignatureCanvas({
 
     ctx.clearRect(0, 0, width, height);
 
-    if (pts.length < 2) return;
-
-    ctx.beginPath();
     ctx.strokeStyle = strokeColor;
     ctx.lineWidth = strokeWidth;
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
 
-    ctx.moveTo(pts[0].x, pts[0].y);
-    for (let i = 1; i < pts.length; i++) {
-      ctx.lineTo(pts[i].x, pts[i].y);
+    for (const pts of allStrokes) {
+      if (pts.length < 2) continue;
+      ctx.beginPath();
+      ctx.moveTo(pts[0].x, pts[0].y);
+      for (let i = 1; i < pts.length; i++) {
+        ctx.lineTo(pts[i].x, pts[i].y);
+      }
+      ctx.stroke();
     }
-    ctx.stroke();
   }, [strokeColor, strokeWidth, width, height]);
 
-  // Redraw when points change
+  // Redraw when strokes change
   useEffect(() => {
-    redraw(points);
-  }, [points, redraw]);
+    redraw(strokes);
+  }, [strokes, redraw]);
 
   const getPos = (e: React.MouseEvent | React.TouchEvent): Point => {
     const canvas = canvasRef.current!;
@@ -82,8 +84,7 @@ export default function SignatureCanvas({
     e.preventDefault();
     setIsDrawing(true);
     const pos = getPos(e);
-    setPoints([pos]);
-    setHasDrawn(true);
+    setStrokes((prev) => [...prev, [pos]]);
   };
 
   const draw = (e: React.MouseEvent | React.TouchEvent) => {
@@ -91,7 +92,12 @@ export default function SignatureCanvas({
     e.preventDefault();
 
     const pos = getPos(e);
-    setPoints((prev) => [...prev, pos]);
+    setStrokes((prev) => {
+      if (prev.length === 0) return prev;
+      const next = [...prev];
+      next[next.length - 1] = [...next[next.length - 1], pos];
+      return next;
+    });
   };
 
   const stopDrawing = () => {
@@ -99,8 +105,7 @@ export default function SignatureCanvas({
   };
 
   const handleClear = () => {
-    setPoints([]);
-    setHasDrawn(false);
+    setStrokes([]);
     const canvas = canvasRef.current;
     if (canvas) {
       const ctx = canvas.getContext("2d");
@@ -109,14 +114,8 @@ export default function SignatureCanvas({
   };
 
   const handleUndo = () => {
-    // Remove last 10 points (approximate stroke)
-    setPoints((prev) => {
-      if (prev.length <= 10) {
-        setHasDrawn(false);
-        return [];
-      }
-      return prev.slice(0, -10);
-    });
+    // Remove the last stroke (one pen lift = one stroke)
+    setStrokes((prev) => prev.slice(0, -1));
   };
 
   const handleSave = () => {
@@ -124,7 +123,7 @@ export default function SignatureCanvas({
     if (!canvas || !hasDrawn) return;
 
     const imageDataUrl = canvas.toDataURL("image/png");
-    onSave(points, imageDataUrl);
+    onSave(strokes, imageDataUrl);
   };
 
   return (
@@ -133,15 +132,15 @@ export default function SignatureCanvas({
       <div className="flex items-center gap-2 p-2 bg-gray-100 rounded-t-lg border">
         <button
           onClick={handleUndo}
-          disabled={points.length === 0}
+          disabled={!hasDrawn}
           className="p-2 hover:bg-gray-200 rounded disabled:opacity-50"
-          title="Undo"
+          title="Undo last stroke"
         >
           <Undo size={18} />
         </button>
         <button
           onClick={handleClear}
-          disabled={points.length === 0}
+          disabled={!hasDrawn}
           className="p-2 hover:bg-gray-200 rounded disabled:opacity-50"
           title="Clear"
         >
