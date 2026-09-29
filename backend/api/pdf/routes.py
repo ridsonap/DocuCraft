@@ -52,6 +52,27 @@ def int_to_rgb255(color: Any, default: tuple[int, int, int] = (0, 0, 0)) -> tupl
     return default
 
 
+def _overlap_area(a: fitz.Rect, b: fitz.Rect) -> float:
+    inter = a & b
+    return inter.width * inter.height if inter else 0.0
+
+
+def derotate_rect(page, x: float, y: float, w: float, h: float) -> tuple:
+    """Convert display (rotated) rect coords to unrotated page coords."""
+    if page.rotation:
+        r = fitz.Rect(x, y, x + max(w, 0.0), y + max(h, 0.0)) * page.derotation_matrix
+        return r.x0, r.y0, r.width, r.height
+    return x, y, w, h
+
+
+def derotate_point(page, x: float, y: float) -> tuple:
+    """Convert display (rotated) point coords to unrotated page coords."""
+    if page.rotation:
+        p = fitz.Point(x, y) * page.derotation_matrix
+        return p.x, p.y
+    return x, y
+
+
 def find_matching_span(
     page,
     old_text: Optional[str],
@@ -61,48 +82,68 @@ def find_matching_span(
     height: float = 0.0,
 ) -> Optional[dict]:
     """Find the exact span in page text_dict that matches the target text block.
-    Returns the span dictionary if matched, or None.
+    Primary: official MuPDF text search clipped to the target rect (expanded 10pt).
+    Fallback: fuzzy scoring, stricter than before. Returns span dict or None.
     """
+    clean_old = old_text.strip() if old_text else ""
     text_dict = page.get_text("dict")
-    clean_old = old_text.strip().lower() if old_text else ""
+    spans = [
+        span
+        for block in text_dict.get("blocks", [])
+        if block.get("type") == 0
+        for line in block.get("lines", [])
+        for span in line.get("spans", [])
+    ]
+    base = fitz.Rect(x, y, x + max(width, 10.0), y + max(height, 8.0))
+
+    if clean_old:
+        clip = base + (-10, -10, 10, 10)
+        try:
+            hits = page.search_for(clean_old, clip=clip)
+        except Exception:
+            hits = []
+        if hits:
+            best_hit = max(hits, key=lambda r: _overlap_area(r, base))
+            best_span = max(spans, key=lambda s: _overlap_area(fitz.Rect(s["bbox"]), best_hit), default=None)
+            if best_span and _overlap_area(fitz.Rect(best_span["bbox"]), best_hit) > 0:
+                return best_span
+
+    # Fallback: fuzzy scoring (stricter threshold)
     best_span = None
     best_score = -1
 
-    for block in text_dict.get("blocks", []):
-        if block.get("type") != 0:
-            continue
-        for line in block.get("lines", []):
-            for span in line.get("spans", []):
-                span_text = span.get("text", "").strip().lower()
-                bbox = span.get("bbox", [0, 0, 0, 0])
-                sx, sy = bbox[0], bbox[1]
-                dist = (sx - x) ** 2 + (sy - y) ** 2
+    for span in spans:
+        span_text = span.get("text", "").strip().lower()
+        bbox = span.get("bbox", [0, 0, 0, 0])
+        sx, sy = bbox[0], bbox[1]
+        dist = (sx - x) ** 2 + (sy - y) ** 2
 
-                score = 0
-                if dist < 4:
-                    score += 50
-                elif dist < 25:
-                    score += 30
-                elif dist < 400:
-                    score += 10
+        score = 0
+        if dist < 4:
+            score += 50
+        elif dist < 25:
+            score += 30
+        elif dist < 400:
+            score += 10
 
-                if clean_old:
-                    if span_text == clean_old:
-                        score += 50
-                    elif clean_old in span_text or span_text in clean_old:
-                        score += 30
-                    else:
-                        words_old = set(clean_old.split())
-                        words_span = set(span_text.split())
-                        overlap = words_old & words_span
-                        if overlap:
-                            score += len(overlap) * 10
+        if clean_old:
+            low_old = clean_old.lower()
+            if span_text == low_old:
+                score += 50
+            elif low_old in span_text or span_text in low_old:
+                score += 30
+            else:
+                words_old = set(low_old.split())
+                words_span = set(span_text.split())
+                overlap = words_old & words_span
+                if overlap:
+                    score += len(overlap) * 10
 
-                if score > best_score:
-                    best_score = score
-                    best_span = span
+        if score > best_score:
+            best_score = score
+            best_span = span
 
-    return best_span if best_score >= 20 else None
+    return best_span if best_score >= 50 else None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -398,6 +439,8 @@ async def extract_text(pdf_id: str, page: Optional[int] = Query(None)) -> dict:
 
     for page_num in range(max(0, start_page), min(end_page, len(doc))):
         p = doc[page_num]
+        # get_text() always returns UNROTATED coords; map to display (rotated) frame
+        rot_m = p.rotation_matrix
         text_dict = p.get_text("dict")
         for block in text_dict.get("blocks", []):
             if block.get("type") != 0:
@@ -407,7 +450,7 @@ async def extract_text(pdf_id: str, page: Optional[int] = Query(None)) -> dict:
                     span_text = span.get("text", "")
                     if not span_text.strip():
                         continue
-                    bbox = span.get("bbox", [0, 0, 0, 0])
+                    bbox = fitz.Rect(span.get("bbox", [0, 0, 0, 0])) * rot_m
                     font_raw = span.get("font", "helv")
                     flags = span.get("flags", 0)
                     font_lower = font_raw.lower()
@@ -419,15 +462,16 @@ async def extract_text(pdf_id: str, page: Optional[int] = Query(None)) -> dict:
 
                     font_family = "mono" if is_mono else ("serif" if is_serif else "sans")
 
-                    origin = span.get("origin", (bbox[0], bbox[3]))
+                    origin_raw = span.get("origin", (span.get("bbox", [0, 0, 0, 0])[0], span.get("bbox", [0, 0, 0, 0])[3]))
+                    origin = fitz.Point(origin_raw) * rot_m
                     blocks.append({
                         "text": span_text,
-                        "x": round(bbox[0], 2),
-                        "y": round(bbox[1], 2),
-                        "width": round(bbox[2] - bbox[0], 2),
-                        "height": round(bbox[3] - bbox[1], 2),
-                        "origin_x": round(origin[0], 2),
-                        "origin_y": round(origin[1], 2),
+                        "x": round(bbox.x0, 2),
+                        "y": round(bbox.y0, 2),
+                        "width": round(bbox.width, 2),
+                        "height": round(bbox.height, 2),
+                        "origin_x": round(origin.x, 2),
+                        "origin_y": round(origin.y, 2),
                         "font_name": font_raw,
                         "font_family": font_family,
                         "is_bold": is_bold,
@@ -554,19 +598,25 @@ async def delete_text(pdf_id: str, request: TextDeleteRequest) -> dict:
 
     page = doc[request.page]
 
+    # Incoming coords are in display (rotated) frame; convert to unrotated
+    ux, uy, uw, uh = derotate_rect(page, request.x, request.y, request.width, request.height)
+
     matching_span = find_matching_span(
         page,
         request.old_text,
-        request.x,
-        request.y,
-        request.width,
-        request.height,
+        ux,
+        uy,
+        uw,
+        uh,
     )
 
     if matching_span:
         rect = fitz.Rect(matching_span["bbox"])
     else:
-        rect = fitz.Rect(request.x, request.y, request.x + max(request.width, 10.0), request.y + max(request.height, 8.0))
+        rect = fitz.Rect(ux, uy, ux + max(uw, 10.0), uy + max(uh, 8.0))
+
+    # Inflate ~1.5pt per side so edge glyphs are fully covered
+    rect = rect + (-1.5, -1.5, 1.5, 1.5)
 
     try:
         # fill=False removes vector text glyphs without painting any rectangle
@@ -603,12 +653,21 @@ async def edit_text(pdf_id: str, request: TextEditRequest) -> dict:
 
     page = doc[request.page]
 
-    # Find the matching text span in the PDF to get exact bbox and origin baseline
-    search_x = request.orig_x if request.orig_x is not None else request.x
-    search_y = request.orig_y if request.orig_y is not None else request.y
-    search_w = request.orig_width if request.orig_width is not None else request.width
-    search_h = request.orig_height if request.orig_height is not None else request.height
+    # Incoming coords are in display (rotated) frame; convert to unrotated
+    ux, uy, _, _ = derotate_rect(page, request.x, request.y, request.width, request.height)
+    search_x, search_y, search_w, search_h = derotate_rect(
+        page,
+        request.orig_x if request.orig_x is not None else request.x,
+        request.orig_y if request.orig_y is not None else request.y,
+        request.orig_width if request.orig_width is not None else request.width,
+        request.orig_height if request.orig_height is not None else request.height,
+    )
+    if request.origin_x is not None and request.origin_y is not None:
+        _, u_origin_y = derotate_point(page, request.origin_x, request.origin_y)
+    else:
+        u_origin_y = None
 
+    # Find the matching text span in the PDF to get exact bbox and origin baseline
     matching_span = find_matching_span(
         page,
         request.old_text,
@@ -628,7 +687,7 @@ async def edit_text(pdf_id: str, request: TextEditRequest) -> dict:
         span_color = matching_span.get("color")
     else:
         orig_bbox = fitz.Rect(search_x, search_y, search_x + max(search_w, 10.0), search_y + max(search_h, 8.0))
-        orig_baseline_y = request.origin_y if request.origin_y is not None else (search_y + (request.font_size or 11.0) * 0.82)
+        orig_baseline_y = u_origin_y if u_origin_y is not None else (search_y + (request.font_size or 11.0) * 0.82)
         orig_anchor_x = search_x
         orig_anchor_y = search_y
         span_font = None
@@ -639,12 +698,13 @@ async def edit_text(pdf_id: str, request: TextEditRequest) -> dict:
     # If bg_color is explicitly provided by the user, fill with that color.
     # If bg_color is None (transparent / default), fill=False so NO white box is drawn!
     redact_fill = normalize_color(request.bg_color) if request.bg_color is not None else False
-    page.add_redact_annot(orig_bbox, fill=redact_fill)
+    # Inflate ~1.5pt per side so edge glyphs are fully covered
+    page.add_redact_annot(orig_bbox + (-1.5, -1.5, 1.5, 1.5), fill=redact_fill)
     page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE, graphics=0)
 
     # Calculate target text insertion position
-    dx = request.x - orig_anchor_x
-    dy = request.y - orig_anchor_y
+    dx = ux - orig_anchor_x
+    dy = uy - orig_anchor_y
     target_x = orig_anchor_x + dx
     target_baseline_y = orig_baseline_y + dy
 
@@ -707,6 +767,10 @@ async def add_text(pdf_id: str, request: TextAddRequest) -> dict:
         raise HTTPException(status_code=400, detail=f"Page {request.page + 1} out of range")
 
     page = doc[request.page]
+
+    # Incoming coords are in display (rotated) frame; convert to unrotated
+    ins_x, ins_y = derotate_point(page, request.x, request.y)
+
     font_name = resolve_pdf_font_name(
         request.font_name,
         request.font_family,
@@ -720,10 +784,10 @@ async def add_text(pdf_id: str, request: TextAddRequest) -> dict:
             bg_norm = normalize_color(request.bg_color)
             f_size = request.font_size or 12.0
             text_w = max(len(request.text) * f_size * 0.6, 20.0)
-            bg_rect = fitz.Rect(request.x, request.y - f_size, request.x + text_w, request.y + 4)
+            bg_rect = fitz.Rect(ins_x, ins_y - f_size, ins_x + text_w, ins_y + 4)
             page.draw_rect(bg_rect, color=None, fill=bg_norm)
 
-        point = fitz.Point(request.x, request.y)
+        point = fitz.Point(ins_x, ins_y)
         page.insert_text(
             point,
             request.text,
