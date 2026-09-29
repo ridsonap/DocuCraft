@@ -7,7 +7,8 @@ import PageOrganizer from "@/components/PageOrganizer";
 import AnnotationToolbar from "@/components/AnnotationToolbar";
 import AnnotationLayer from "@/components/AnnotationLayer";
 import SignatureCanvas from "@/components/SignatureCanvas";
-import { api } from "@/lib/api";
+import ToolsPanel from "@/components/ToolsPanel";
+import { api, downloadBlob } from "@/lib/api";
 import { TextBlock } from "@/types/pdf";
 import { Annotation, AnnotationType } from "@/types/annotation";
 import {
@@ -22,13 +23,13 @@ import {
   AlertCircle,
   Plus,
   Copy,
-  FileText,
   FileCheck,
   RefreshCw,
   Sparkles,
+  Wrench,
 } from "lucide-react";
 
-type Tab = "edit" | "organize" | "annotate" | "ocr";
+type Tab = "edit" | "organize" | "annotate" | "ocr" | "tools";
 
 export default function HomePage() {
   const [pdfData, setPdfData] = useState<ArrayBuffer | null>(null);
@@ -59,10 +60,12 @@ export default function HomePage() {
   const [copiedText, setCopiedText] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const showToast = (text: string, type: "success" | "error" | "info" = "success") => {
     setToastMessage({ text, type });
-    setTimeout(() => setToastMessage(null), 3500);
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = setTimeout(() => setToastMessage(null), 3500);
   };
 
   // Reload PDF binary bytes from backend
@@ -134,6 +137,11 @@ export default function HomePage() {
     }
   };
 
+  // Refresh PDF bytes after an in-place tool modified the document
+  const handleToolsChanged = async () => {
+    await reloadPDF();
+  };
+
   // Handle edit completion
   const handleEditComplete = async () => {
     showToast("Teks berhasil diperbarui pada PDF!");
@@ -166,7 +174,8 @@ export default function HomePage() {
       const targetPage = pageOnly ? currentPage - 1 : undefined;
       const results = await api.performOCR(pdfId, targetPage);
       setOcrResults(results);
-      showToast(`OCR selesai memproses ${results.pages.length} halaman!`);
+      const pageCount = results.pages?.length ?? 0;
+      showToast(`OCR selesai memproses ${pageCount} halaman!`);
     } catch (err: any) {
       console.error("OCR failed:", err);
       setOcrError(
@@ -186,15 +195,8 @@ export default function HomePage() {
     try {
       showToast("Menyiapkan ekspor anotasi...", "info");
       const blob = await api.exportWithAnnotations(pdfId);
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
       const cleanName = filename.replace(/\.pdf$/i, "");
-      a.download = `${cleanName}_annotated.pdf`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
+      downloadBlob(blob, `${cleanName}_annotated.pdf`);
       showToast("PDF dengan anotasi berhasil diekspor!");
     } catch (err) {
       console.error("Export failed:", err);
@@ -248,11 +250,16 @@ export default function HomePage() {
   // Copy OCR text
   const handleCopyOCRText = () => {
     if (!ocrResults) return;
-    const full = ocrResults.pages.map((p: any) => `--- Halaman ${p.page + 1} ---\n${p.full_text}`).join("\n\n");
-    navigator.clipboard.writeText(full);
-    setCopiedText(true);
-    setTimeout(() => setCopiedText(false), 2000);
-    showToast("Teks hasil OCR berhasil disalin!");
+    const pages = ocrResults.pages || [];
+    const full = pages.map((p: any) => `--- Halaman ${p.page + 1} ---\n${p.full_text}`).join("\n\n");
+    navigator.clipboard.writeText(full).then(
+      () => {
+        setCopiedText(true);
+        setTimeout(() => setCopiedText(false), 2000);
+        showToast("Teks hasil OCR berhasil disalin!");
+      },
+      () => showToast("Gagal menyalin ke clipboard", "error")
+    );
   };
 
   const formatFileSize = (bytes: number) => {
@@ -419,6 +426,20 @@ export default function HomePage() {
                 <ScanSearch size={20} className="mb-1" />
                 <span className="text-[11px] leading-tight text-center">OCR</span>
               </button>
+
+              {/* Tools Tab */}
+              <button
+                onClick={() => setActiveTab("tools")}
+                className={`w-full flex flex-col items-center justify-center py-3 px-1 rounded-xl transition-all ${
+                  activeTab === "tools"
+                    ? "bg-blue-600 text-white shadow-md font-medium"
+                    : "hover:bg-slate-800 text-slate-400 hover:text-slate-200"
+                }`}
+                title="Merge, Split, Kompres, Watermark, dan lainnya"
+              >
+                <Wrench size={20} className="mb-1" />
+                <span className="text-[11px] leading-tight text-center">Tools</span>
+              </button>
             </div>
 
             <div className="mt-auto px-2">
@@ -581,7 +602,7 @@ export default function HomePage() {
                     <div className="space-y-4">
                       <div className="flex items-center justify-between border-b pb-3">
                         <span className="font-semibold text-sm text-gray-800">
-                          Hasil Ekstraksi Teks ({ocrResults.pages.length} Halaman Diproses)
+                          Hasil Ekstraksi Teks ({ocrResults.pages?.length ?? 0} Halaman Diproses)
                         </span>
 
                         <button
@@ -594,7 +615,7 @@ export default function HomePage() {
                       </div>
 
                       <div className="space-y-4 max-h-[500px] overflow-auto pr-1">
-                        {ocrResults.pages.map((p: any) => (
+                        {(ocrResults.pages || []).map((p: any) => (
                           <div key={p.page} className="border rounded-xl p-4 bg-gray-50/50">
                             <div className="flex items-center justify-between mb-2">
                               <span className="text-xs font-semibold text-gray-700 bg-white px-2 py-0.5 rounded border">
@@ -614,6 +635,17 @@ export default function HomePage() {
                   )}
                 </div>
               </div>
+            )}
+
+            {/* 5. Tools Tab */}
+            {activeTab === "tools" && (
+              <ToolsPanel
+                pdfId={pdfId}
+                filename={filename}
+                totalPages={totalPages}
+                onChanged={handleToolsChanged}
+                notify={showToast}
+              />
             )}
           </main>
         </div>

@@ -100,7 +100,6 @@ export default function TextEditLayer({
   const [toolbarPos, setToolbarPos] = useState<ToolbarPosition>({ x: 0, y: 0 });
 
   const containerRef = useRef<HTMLDivElement>(null);
-  const textboxRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const dragStateRef = useRef<DragState>(dragState);
   dragStateRef.current = dragState;
@@ -697,7 +696,6 @@ export default function TextEditLayer({
 
           {/* The Editable Resizable Textbox */}
           <div
-            ref={textboxRef}
             onClick={(e) => e.stopPropagation()}
             className="absolute z-40 select-none"
             style={{
