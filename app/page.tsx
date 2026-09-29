@@ -205,14 +205,15 @@ export default function HomePage() {
   };
 
   // Signature save
-  const handleSignatureSave = async (points: { x: number; y: number }[]) => {
-    if (!pdfId || points.length < 2) return;
+  const handleSignatureSave = async (strokes: { x: number; y: number }[][]) => {
+    if (!pdfId || strokes.length === 0) return;
 
     try {
       const payload = {
         type: AnnotationType.FREEHAND as const,
         page: currentPage - 1,
-        points,
+        points: strokes.flat(),
+        strokes,
         stroke_color: [0, 0, 0] as [number, number, number],
         stroke_width: 2.5,
         opacity: 1.0,

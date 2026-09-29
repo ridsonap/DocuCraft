@@ -5,7 +5,7 @@ export enum AnnotationType {
   TEXT_BOX = "text_box",
   HIGHLIGHT = "highlight",
   STICKY_NOTE = "sticky_note",
-  STAMP = "stamp",
+  IMAGE = "image",
 }
 
 export interface Point {
@@ -22,6 +22,7 @@ export interface BaseAnnotation {
 export interface FreehandAnnotation extends BaseAnnotation {
   type: AnnotationType.FREEHAND;
   points: Point[];
+  strokes?: Point[][];
   stroke_color: [number, number, number];
   stroke_width: number;
   opacity: number;
@@ -58,14 +59,13 @@ export interface StickyNoteAnnotation extends BaseAnnotation {
   color: string;
 }
 
-export interface StampAnnotation extends BaseAnnotation {
-  type: AnnotationType.STAMP;
+export interface ImageAnnotation extends BaseAnnotation {
+  type: AnnotationType.IMAGE;
   x: number;
   y: number;
   width: number;
   height: number;
-  text: string;
-  color: [number, number, number];
+  data_url: string;
 }
 
 export type Annotation =
@@ -73,13 +73,14 @@ export type Annotation =
   | TextBoxAnnotation
   | HighlightAnnotation
   | StickyNoteAnnotation
-  | StampAnnotation;
+  | ImageAnnotation;
 
 // API payload types (for sending to backend)
 export interface FreehandPayload {
   type: AnnotationType.FREEHAND;
   page: number;
   points: Point[];
+  strokes?: Point[][];
   stroke_color: [number, number, number];
   stroke_width?: number;
   opacity?: number;
@@ -119,15 +120,14 @@ export interface StickyNotePayload {
   color?: string;
 }
 
-export interface StampPayload {
-  type: AnnotationType.STAMP;
+export interface ImagePayload {
+  type: AnnotationType.IMAGE;
   page: number;
   x: number;
   y: number;
   width?: number;
   height?: number;
-  text: string;
-  color?: [number, number, number];
+  data_url: string;
 }
 
 export type AnnotationPayload =
@@ -135,4 +135,4 @@ export type AnnotationPayload =
   | TextBoxPayload
   | HighlightPayload
   | StickyNotePayload
-  | StampPayload;
+  | ImagePayload;
