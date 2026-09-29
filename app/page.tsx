@@ -57,6 +57,7 @@ export default function HomePage() {
   const [ocrResults, setOcrResults] = useState<any>(null);
   const [ocrLoading, setOcrLoading] = useState(false);
   const [ocrError, setOcrError] = useState<string | null>(null);
+  const [ocrProgress, setOcrProgress] = useState<string | null>(null);
   const [copiedText, setCopiedText] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -116,7 +117,8 @@ export default function HomePage() {
     setLoading(true);
     try {
       const data = await file.arrayBuffer();
-      const result = await api.uploadPDF(file);
+      const { uploadPDFSmart } = await import("@/lib/blobUpload");
+      const result = await uploadPDFSmart(file);
 
       setPdfData(data);
       setPdfId(result.id);
@@ -164,27 +166,47 @@ export default function HomePage() {
     }
   };
 
-  // Run OCR
+  // Run OCR — backend native Tesseract when available, else tesseract.js in-browser
   const handleOCRScan = async (pageOnly: boolean = false) => {
     if (!pdfId) return;
 
     setOcrLoading(true);
     setOcrError(null);
+    setOcrProgress(null);
     try {
       const targetPage = pageOnly ? currentPage - 1 : undefined;
-      const results = await api.performOCR(pdfId, targetPage);
+
+      let backendOCR = false;
+      try {
+        backendOCR = (await api.checkHealth()).ocr_available === true;
+      } catch {
+        /* health unreachable — fall through to client-side OCR */
+      }
+
+      let results;
+      if (backendOCR) {
+        results = await api.performOCR(pdfId, targetPage);
+      } else {
+        setOcrProgress("Menyiapkan OCR di browser…");
+        const { performClientOCR } = await import("@/lib/ocrClient");
+        const bytes = pdfData ?? (await api.fetchPDFBytes(pdfId));
+        results = await performClientOCR(
+          bytes,
+          targetPage !== undefined ? [targetPage] : undefined,
+          (p) => setOcrProgress(`OCR browser: ${p.status} ${Math.round(p.progress * 100)}%`)
+        );
+      }
+
       setOcrResults(results);
       const pageCount = results.pages?.length ?? 0;
       showToast(`OCR selesai memproses ${pageCount} halaman!`);
     } catch (err: any) {
       console.error("OCR failed:", err);
-      setOcrError(
-        err?.message ||
-          "Gagal menjalankan OCR. Tesseract OCR belum terpasang di sistem. Pasang Tesseract atau jalankan via Docker."
-      );
+      setOcrError(err?.message || "Gagal menjalankan OCR.");
       showToast("OCR gagal dijalankan", "error");
     } finally {
       setOcrLoading(false);
+      setOcrProgress(null);
     }
   };
 
@@ -582,6 +604,9 @@ export default function HomePage() {
                       {ocrLoading ? <RefreshCw size={14} className="animate-spin" /> : <ScanSearch size={14} />}
                       Scan Semua Halaman ({totalPages})
                     </button>
+                    {ocrLoading && ocrProgress && (
+                      <span className="text-xs text-slate-500">{ocrProgress}</span>
+                    )}
                   </div>
 
                   {/* Error Notification */}
@@ -592,7 +617,7 @@ export default function HomePage() {
                         <div className="font-semibold mb-1">Pemberitahuan OCR Engine:</div>
                         <div>{ocrError}</div>
                         <div className="mt-2 text-amber-700">
-                          Tips: Jalankan <code className="bg-amber-100 px-1 py-0.5 rounded font-mono">brew install tesseract</code> di macOS atau deploy menggunakan Dockerfile yang telah disertakan.
+                          Tips: DocuCraft otomatis memakai OCR di browser (tesseract.js) bila server tidak menyediakan Tesseract native.
                         </div>
                       </div>
                     </div>

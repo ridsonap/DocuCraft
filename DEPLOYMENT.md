@@ -6,6 +6,36 @@ DocuCraft adalah aplikasi web modern untuk mengedit PDF, mengatur halaman, membu
 
 ## 🚀 Pilihan Deployment
 
+> **Rekomendasi untuk Vercel — Metode 0 di bawah.** DocuCraft-v2 dideploy sebagai **dua project Vercel**:
+> (A) backend FastAPI (`backend/`, auto-detect via FastAPI preset) dan (B) frontend Next.js (root repo).
+> OCR berjalan di browser via tesseract.js, jadi tidak butuh Tesseract native di server.
+
+### Metode 0: Vercel (2 project)
+
+**A. Backend** — Vercel Dashboard → Add New → Project → import `ridsonap/DocuCraft-v2`
+1. Set **Root Directory** = `backend`, Framework Preset = **FastAPI** (atau Other).
+2. Environment Variables:
+   - `STORAGE_BACKEND` = `blob`
+   - `BLOB_READ_WRITE_TOKEN` = token dari Storage → Blob store → tab `.env.local`
+   - `CORS_ORIGINS` = URL frontend production, mis. `https://docucraft-v2.vercel.app`
+3. Deploy. Catat URL-nya, mis. `https://docucraft-v2-api.vercel.app`.
+   `backend/vercel.json` sudah menaikkan `maxDuration` ke 60 dtk (butuh Pro plan; di Hobby di-clamp).
+
+**B. Frontend** — Add New → Project → import repo yang sama
+1. **Root Directory** = `.` (root repo), Framework Preset = **Next.js**.
+2. Environment Variables:
+   - `NEXT_PUBLIC_API_URL` = URL backend dari langkah A.
+3. Deploy. `next.config.js` me-rewrite `/api/pdf/*` ke backend otomatis.
+
+**Batasan serverless yang perlu diketahui:**
+- Upload langsung browser → Blob (tanpa lewat function), jadi file besar lolos dari limit body ±4,5 MB.
+- `merge`, `images-to-pdf`, `unlock` tetap multipart in→out (tetap kena limit ±4,5 MB).
+- OCR: backend (`/ocr`) hanya aktif bila binary Tesseract terpasang (self-hosted/Docker);
+  di Vercel, frontend otomatis memakai **tesseract.js di browser** (fallback otomatis).
+- Storage `memory` (default lokal) hilang saat function cold-start — untuk produksi selalu pakai `blob`.
+
+
+
 | Metode | Rekomendasi Untuk | Kemudahan |
 |---|---|---|
 | **Metode 1: Docker Compose** | Server VPS / VM (Docker) | ⭐⭐⭐⭐⭐ (1 Perintah) |

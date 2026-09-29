@@ -59,16 +59,6 @@ async function fetchBlob(url: string, options?: RequestInit): Promise<Blob> {
 }
 
 export const api = {
-  // Upload
-  uploadPDF: async (file: File) => {
-    const formData = new FormData();
-    formData.append('file', file);
-    return fetchJSON<{ id: string; filename: string; page_count: number; size: number }>(
-      '/api/pdf/upload',
-      { method: 'POST', body: formData }
-    );
-  },
-
   // Fetch binary PDF bytes
   fetchPDFBytes: async (pdfId: string): Promise<ArrayBuffer> => {
     const res = await fetch(`${API_BASE}/api/pdf/${pdfId}/download`);
@@ -273,6 +263,6 @@ export const api = {
 
   // Health check
   checkHealth: async () => {
-    return fetchJSON<{ status: string; service?: string }>('/api/pdf/health');
+    return fetchJSON<{ status: string; service?: string; ocr_available?: boolean; storage_backend?: string }>('/api/pdf/health');
   },
 };
