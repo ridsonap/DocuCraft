@@ -10,8 +10,8 @@ from typing import Optional, Union, Any
 from dataclasses import dataclass
 from enum import Enum
 
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Query, Body
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Query, Body, Request
+from fastapi.responses import StreamingResponse, RedirectResponse
 from pydantic import BaseModel as PydanticBaseModel, Field
 
 try:
@@ -20,10 +20,14 @@ except ImportError:
     import fitz
 
 
-# Global in-memory storage (maps pdf_id -> bytes)
-PDF_STORAGE: dict[str, bytes] = {}
-PDF_METADATA: dict[str, dict] = {}
-ANNOTATION_STORE: dict[str, dict[str, dict]] = {}
+# Document storage: MemoryStorage (local dev) or BlobStorage (Vercel).
+# Selected once via the STORAGE_BACKEND env var.
+try:
+    from storage import get_storage
+except ImportError:  # package mode (imported as backend.api.pdf.routes)
+    from backend.storage import get_storage
+
+storage = get_storage()
 
 
 def normalize_color(color: Any, default: tuple[float, float, float] = (0.0, 0.0, 0.0)) -> tuple[float, float, float]:
@@ -255,14 +259,14 @@ async def upload_pdf(file: UploadFile = File(...)) -> dict:
         raise HTTPException(status_code=400, detail=f"Invalid or corrupted PDF: {str(e)}")
 
     pdf_id = f"pdf_{uuid.uuid4().hex[:12]}"
-    PDF_STORAGE[pdf_id] = content
-    PDF_METADATA[pdf_id] = {
+    storage.put_pdf(pdf_id, content)
+    storage.put_meta(pdf_id, {
         "id": pdf_id,
         "filename": filename or "document.pdf",
         "page_count": page_count,
         "size": len(content),
-    }
-    ANNOTATION_STORE[pdf_id] = {}
+    })
+    storage.put_annotations(pdf_id, {})
 
     return {
         "id": pdf_id,
@@ -272,20 +276,96 @@ async def upload_pdf(file: UploadFile = File(...)) -> dict:
     }
 
 
+class RegisterUploadRequest(PydanticBaseModel):
+    pdf_id: str = Field(..., description="Client-generated id, e.g. pdf_<12 hex chars>")
+    filename: str = Field(..., description="Original filename")
+
+
+def _valid_upload_pathname(pathname: str) -> bool:
+    # Only allow the exact final location the browser uploads to.
+    return bool(re.fullmatch(r"docucraft/pdfs/pdf_[0-9a-f]{12}\.pdf", pathname or ""))
+
+
+@router.post("/blob-client-token")
+async def blob_client_token(request: Request):
+    """Mint a short-lived token for direct browser-to-Blob upload.
+
+    Implements the @vercel/blob client-upload handshake: the browser POSTs
+    {type: "blob.generate-client-token", payload: {pathname}} and PUTs the
+    file straight to Blob with the returned clientToken, bypassing the
+    serverless request body limit entirely.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    pathname = (body.get("payload") or {}).get("pathname", "")
+    if not _valid_upload_pathname(pathname):
+        raise HTTPException(status_code=400, detail="Invalid upload pathname")
+    try:
+        token = storage.create_upload_token(pathname)
+    except NotImplementedError:
+        raise HTTPException(status_code=501, detail="Direct upload is not supported by this storage backend")
+    return {"type": "blob.generate-client-token", "clientToken": token}
+
+
+@router.post("/register-upload")
+async def register_upload(req: RegisterUploadRequest):
+    """Register a PDF the browser uploaded directly to Blob.
+
+    Validates the bytes with PyMuPDF, writes metadata + empty annotations,
+    and returns the same shape as /upload.
+    """
+    filename = req.filename or ""
+    if not filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="File must be a PDF document")
+    if not re.fullmatch(r"pdf_[0-9a-f]{12}", req.pdf_id or ""):
+        raise HTTPException(status_code=400, detail="Invalid pdf_id")
+
+    data = storage.get_pdf(req.pdf_id)
+    if not data:
+        raise HTTPException(
+            status_code=404,
+            detail="Uploaded bytes not found; upload via /blob-client-token first",
+        )
+    try:
+        doc = fitz.open(stream=data, filetype="pdf")
+        page_count = len(doc)
+        doc.close()
+    except Exception as e:
+        storage.delete_pdf(req.pdf_id)
+        raise HTTPException(status_code=400, detail=f"Invalid or corrupted PDF: {str(e)}")
+
+    storage.put_meta(req.pdf_id, {
+        "id": req.pdf_id,
+        "filename": filename or "document.pdf",
+        "page_count": page_count,
+        "size": len(data),
+    })
+    storage.put_annotations(req.pdf_id, {})
+
+    return {
+        "id": req.pdf_id,
+        "filename": filename or "document.pdf",
+        "page_count": page_count,
+        "size": len(data),
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SHARED HELPERS (new endpoints)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _open_stored_pdf(pdf_id: str):
     """Open a stored PDF, authenticating with the stored password if encrypted."""
-    if pdf_id not in PDF_STORAGE:
+    if not storage.pdf_exists(pdf_id):
         raise HTTPException(status_code=404, detail="PDF document not found")
     try:
-        doc = fitz.open(stream=PDF_STORAGE[pdf_id], filetype="pdf")
+        doc = fitz.open(stream=storage.get_pdf(pdf_id), filetype="pdf")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to open PDF: {str(e)}")
     if doc.needs_pass:
-        pw = PDF_METADATA.get(pdf_id, {}).get("password")
+        pw = storage.get_meta(pdf_id).get("password")
         if not pw or not doc.authenticate(pw):
             doc.close()
             raise HTTPException(status_code=401, detail="PDF is password protected")
@@ -296,12 +376,10 @@ def _persist_pdf(pdf_id: str, doc, **save_kwargs) -> bytes:
     """Save doc back into in-memory storage and refresh metadata size.
     Re-applies stored encryption settings so mutations don't strip protection."""
     output = io.BytesIO()
-    enc_kwargs = PDF_METADATA.get(pdf_id, {}).get("enc_kwargs", {})
+    enc_kwargs = storage.get_meta(pdf_id).get("enc_kwargs", {})
     doc.save(output, garbage=4, deflate=True, **{**enc_kwargs, **save_kwargs})
     data = output.getvalue()
-    PDF_STORAGE[pdf_id] = data
-    if pdf_id in PDF_METADATA:
-        PDF_METADATA[pdf_id]["size"] = len(data)
+    storage.put_pdf(pdf_id, data)
     return data
 
 
@@ -317,8 +395,26 @@ def _file_response(data: bytes, filename: str, media_type: str = "application/pd
     )
 
 
+def _send_file(data: bytes, filename: str, media_type: str = "application/pdf",
+             pdf_id: Optional[str] = None):
+    """Serve file bytes, or redirect to Blob storage when available.
+
+    Redirects keep large files out of the serverless request/response body
+    limit; the browser follows them transparently via fetch().
+    """
+    if pdf_id is not None:
+        url = storage.public_url(pdf_id)
+        if url:
+            return RedirectResponse(url, status_code=307)
+    else:
+        url = storage.put_result(data, filename, media_type)
+        if url:
+            return RedirectResponse(url, status_code=307)
+    return _file_response(data, filename, media_type)
+
+
 def _stem(pdf_id: str, fallback: str) -> str:
-    raw = PDF_METADATA.get(pdf_id, {}).get("filename", fallback)
+    raw = storage.get_meta(pdf_id).get("filename", fallback)
     return raw.rsplit(".", 1)[0] if "." in raw else raw
 
 
@@ -425,11 +521,11 @@ async def unlock_pdf(file: UploadFile = File(...), password: str = Form(...)):
 
 @router.get("/{pdf_id}/extract-text")
 async def extract_text(pdf_id: str, page: Optional[int] = Query(None)) -> dict:
-    if pdf_id not in PDF_STORAGE:
+    if not storage.pdf_exists(pdf_id):
         raise HTTPException(status_code=404, detail="PDF document not found")
 
     try:
-        doc = fitz.open(stream=PDF_STORAGE[pdf_id], filetype="pdf")
+        doc = fitz.open(stream=storage.get_pdf(pdf_id), filetype="pdf")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to open PDF: {str(e)}")
 
@@ -584,11 +680,11 @@ class TextDeleteRequest(PydanticBaseModel):
 @router.post("/{pdf_id}/delete-text")
 async def delete_text(pdf_id: str, request: TextDeleteRequest) -> dict:
     """Remove text from the PDF cleanly without leaving any box or touching table lines."""
-    if pdf_id not in PDF_STORAGE:
+    if not storage.pdf_exists(pdf_id):
         raise HTTPException(status_code=404, detail="PDF not found")
 
     try:
-        doc = fitz.open(stream=PDF_STORAGE[pdf_id], filetype="pdf")
+        doc = fitz.open(stream=storage.get_pdf(pdf_id), filetype="pdf")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to open PDF: {str(e)}")
 
@@ -625,9 +721,7 @@ async def delete_text(pdf_id: str, request: TextDeleteRequest) -> dict:
 
         output = io.BytesIO()
         doc.save(output, garbage=3, deflate=True)
-        PDF_STORAGE[pdf_id] = output.getvalue()
-        if pdf_id in PDF_METADATA:
-            PDF_METADATA[pdf_id]["size"] = len(PDF_STORAGE[pdf_id])
+        storage.put_pdf(pdf_id, output.getvalue())
     except Exception as e:
         doc.close()
         raise HTTPException(status_code=500, detail=f"Failed to delete text: {str(e)}")
@@ -639,11 +733,11 @@ async def delete_text(pdf_id: str, request: TextDeleteRequest) -> dict:
 @router.post("/{pdf_id}/edit-text")
 async def edit_text(pdf_id: str, request: TextEditRequest) -> dict:
     """Edit text in place: cleanly removes old text and inserts replacement at the exact baseline."""
-    if pdf_id not in PDF_STORAGE:
+    if not storage.pdf_exists(pdf_id):
         raise HTTPException(status_code=404, detail="PDF not found")
 
     try:
-        doc = fitz.open(stream=PDF_STORAGE[pdf_id], filetype="pdf")
+        doc = fitz.open(stream=storage.get_pdf(pdf_id), filetype="pdf")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to open PDF: {str(e)}")
 
@@ -741,9 +835,7 @@ async def edit_text(pdf_id: str, request: TextEditRequest) -> dict:
 
         output = io.BytesIO()
         doc.save(output, garbage=3, deflate=True)
-        PDF_STORAGE[pdf_id] = output.getvalue()
-        if pdf_id in PDF_METADATA:
-            PDF_METADATA[pdf_id]["size"] = len(PDF_STORAGE[pdf_id])
+        storage.put_pdf(pdf_id, output.getvalue())
     except Exception as e:
         doc.close()
         raise HTTPException(status_code=500, detail=f"Failed to replace text: {str(e)}")
@@ -754,11 +846,11 @@ async def edit_text(pdf_id: str, request: TextEditRequest) -> dict:
 
 @router.post("/{pdf_id}/add-text")
 async def add_text(pdf_id: str, request: TextAddRequest) -> dict:
-    if pdf_id not in PDF_STORAGE:
+    if not storage.pdf_exists(pdf_id):
         raise HTTPException(status_code=404, detail="PDF not found")
 
     try:
-        doc = fitz.open(stream=PDF_STORAGE[pdf_id], filetype="pdf")
+        doc = fitz.open(stream=storage.get_pdf(pdf_id), filetype="pdf")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to open PDF: {str(e)}")
 
@@ -797,9 +889,7 @@ async def add_text(pdf_id: str, request: TextAddRequest) -> dict:
         )
         output = io.BytesIO()
         doc.save(output, garbage=3, deflate=True)
-        PDF_STORAGE[pdf_id] = output.getvalue()
-        if pdf_id in PDF_METADATA:
-            PDF_METADATA[pdf_id]["size"] = len(PDF_STORAGE[pdf_id])
+        storage.put_pdf(pdf_id, output.getvalue())
     except Exception as e:
         doc.close()
         raise HTTPException(status_code=500, detail=f"Failed to insert text: {str(e)}")
@@ -814,10 +904,10 @@ async def add_text(pdf_id: str, request: TextAddRequest) -> dict:
 
 @router.get("/{pdf_id}/ocr-detect")
 async def detect_scanned_pages(pdf_id: str) -> dict:
-    if pdf_id not in PDF_STORAGE:
+    if not storage.pdf_exists(pdf_id):
         raise HTTPException(status_code=404, detail="PDF not found")
 
-    doc = fitz.open(stream=PDF_STORAGE[pdf_id], filetype="pdf")
+    doc = fitz.open(stream=storage.get_pdf(pdf_id), filetype="pdf")
     scanned_pages = []
 
     for page_num in range(len(doc)):
@@ -837,7 +927,7 @@ async def detect_scanned_pages(pdf_id: str) -> dict:
 
 @router.post("/{pdf_id}/ocr")
 async def perform_ocr(pdf_id: str, page: Optional[int] = Query(None)) -> dict:
-    if pdf_id not in PDF_STORAGE:
+    if not storage.pdf_exists(pdf_id):
         raise HTTPException(status_code=404, detail="PDF not found")
 
     try:
@@ -846,7 +936,7 @@ async def perform_ocr(pdf_id: str, page: Optional[int] = Query(None)) -> dict:
     except ImportError:
         raise HTTPException(status_code=503, detail="Pytesseract Python package is not installed.")
 
-    doc = fitz.open(stream=PDF_STORAGE[pdf_id], filetype="pdf")
+    doc = fitz.open(stream=storage.get_pdf(pdf_id), filetype="pdf")
     results = []
 
     target_pages = [page] if page is not None else list(range(len(doc)))
@@ -905,10 +995,10 @@ async def perform_ocr(pdf_id: str, page: Optional[int] = Query(None)) -> dict:
 
 @router.get("/{pdf_id}/pages")
 async def get_page_thumbnails(pdf_id: str, size: int = Query(160)) -> dict:
-    if pdf_id not in PDF_STORAGE:
+    if not storage.pdf_exists(pdf_id):
         raise HTTPException(status_code=404, detail="PDF not found")
 
-    doc = fitz.open(stream=PDF_STORAGE[pdf_id], filetype="pdf")
+    doc = fitz.open(stream=storage.get_pdf(pdf_id), filetype="pdf")
     thumbnails = []
 
     for page_num in range(len(doc)):
@@ -939,12 +1029,12 @@ async def get_page_thumbnails(pdf_id: str, size: int = Query(160)) -> dict:
 
 @router.post("/{pdf_id}/rotate")
 async def rotate_pages(pdf_id: str, pages: list[int], degrees: int = Query(..., ge=90, le=270)) -> dict:
-    if pdf_id not in PDF_STORAGE:
+    if not storage.pdf_exists(pdf_id):
         raise HTTPException(status_code=404, detail="PDF not found")
     if degrees % 90 != 0:
         raise HTTPException(status_code=400, detail="Degrees must be a multiple of 90")
 
-    doc = fitz.open(stream=PDF_STORAGE[pdf_id], filetype="pdf")
+    doc = fitz.open(stream=storage.get_pdf(pdf_id), filetype="pdf")
 
     for page_num in pages:
         if 0 <= page_num < len(doc):
@@ -953,21 +1043,18 @@ async def rotate_pages(pdf_id: str, pages: list[int], degrees: int = Query(..., 
 
     output = io.BytesIO()
     doc.save(output, garbage=3, deflate=True)
-    PDF_STORAGE[pdf_id] = output.getvalue()
+    storage.put_pdf(pdf_id, output.getvalue())
     doc.close()
-
-    if pdf_id in PDF_METADATA:
-        PDF_METADATA[pdf_id]["size"] = len(PDF_STORAGE[pdf_id])
 
     return {"success": True, "rotated_pages": pages, "degrees": degrees}
 
 
 @router.post("/{pdf_id}/delete-pages")
 async def delete_pages(pdf_id: str, pages: list[int]) -> dict:
-    if pdf_id not in PDF_STORAGE:
+    if not storage.pdf_exists(pdf_id):
         raise HTTPException(status_code=404, detail="PDF not found")
 
-    doc = fitz.open(stream=PDF_STORAGE[pdf_id], filetype="pdf")
+    doc = fitz.open(stream=storage.get_pdf(pdf_id), filetype="pdf")
 
     if len(pages) >= len(doc):
         doc.close()
@@ -981,23 +1068,20 @@ async def delete_pages(pdf_id: str, pages: list[int]) -> dict:
 
     output = io.BytesIO()
     doc.save(output, garbage=3, deflate=True)
-    PDF_STORAGE[pdf_id] = output.getvalue()
+    storage.put_pdf(pdf_id, output.getvalue())
     new_page_count = len(doc)
+    storage.update_meta(pdf_id, page_count=new_page_count)
     doc.close()
-
-    if pdf_id in PDF_METADATA:
-        PDF_METADATA[pdf_id]["page_count"] = new_page_count
-        PDF_METADATA[pdf_id]["size"] = len(PDF_STORAGE[pdf_id])
 
     return {"success": True, "deleted": deleted, "page_count": new_page_count}
 
 
 @router.post("/{pdf_id}/reorder")
 async def reorder_pages(pdf_id: str, new_order: list[int]) -> dict:
-    if pdf_id not in PDF_STORAGE:
+    if not storage.pdf_exists(pdf_id):
         raise HTTPException(status_code=404, detail="PDF not found")
 
-    doc = fitz.open(stream=PDF_STORAGE[pdf_id], filetype="pdf")
+    doc = fitz.open(stream=storage.get_pdf(pdf_id), filetype="pdf")
 
     if len(new_order) != len(doc):
         doc.close()
@@ -1010,13 +1094,10 @@ async def reorder_pages(pdf_id: str, new_order: list[int]) -> dict:
 
     output = io.BytesIO()
     new_doc.save(output, garbage=3, deflate=True)
-    PDF_STORAGE[pdf_id] = output.getvalue()
+    storage.put_pdf(pdf_id, output.getvalue())
 
     new_doc.close()
     doc.close()
-
-    if pdf_id in PDF_METADATA:
-        PDF_METADATA[pdf_id]["size"] = len(PDF_STORAGE[pdf_id])
 
     return {"success": True, "new_order": new_order}
 
@@ -1028,10 +1109,10 @@ async def insert_blank_page(
     width: float = 595.0,
     height: float = 842.0
 ) -> dict:
-    if pdf_id not in PDF_STORAGE:
+    if not storage.pdf_exists(pdf_id):
         raise HTTPException(status_code=404, detail="PDF not found")
 
-    doc = fitz.open(stream=PDF_STORAGE[pdf_id], filetype="pdf")
+    doc = fitz.open(stream=storage.get_pdf(pdf_id), filetype="pdf")
     if width <= 0 or height <= 0:
         doc.close()
         raise HTTPException(status_code=400, detail="width and height must be positive")
@@ -1041,13 +1122,10 @@ async def insert_blank_page(
 
     output = io.BytesIO()
     doc.save(output, garbage=3, deflate=True)
-    PDF_STORAGE[pdf_id] = output.getvalue()
+    storage.put_pdf(pdf_id, output.getvalue())
     new_page_count = len(doc)
+    storage.update_meta(pdf_id, page_count=new_page_count)
     doc.close()
-
-    if pdf_id in PDF_METADATA:
-        PDF_METADATA[pdf_id]["page_count"] = new_page_count
-        PDF_METADATA[pdf_id]["size"] = len(PDF_STORAGE[pdf_id])
 
     return {"success": True, "page_count": new_page_count, "inserted_at": pno}
 
@@ -1082,7 +1160,7 @@ async def split_pdf(pdf_id: str, request: SplitRequest):
     finally:
         doc.close()
 
-    return _file_response(data, f"{_stem(pdf_id, pdf_id)}_split.pdf")
+    return _send_file(data, f"{_stem(pdf_id, pdf_id)}_split.pdf", "application/pdf")
 
 
 class CompressRequest(PydanticBaseModel):
@@ -1096,7 +1174,7 @@ async def compress_pdf(pdf_id: str, request: CompressRequest) -> dict:
         raise HTTPException(status_code=400, detail="level must be one of: low, medium, high")
 
     doc = _open_stored_pdf(pdf_id)
-    original_size = len(PDF_STORAGE[pdf_id])
+    original_size = storage.get_meta(pdf_id).get("size", 0)
     try:
         if level == "high":
             # Downscale large images (target <=1200px) and re-encode as JPEG
@@ -1147,7 +1225,7 @@ async def export_images(pdf_id: str, dpi: int = Query(150, ge=72, le=300)):
     finally:
         doc.close()
 
-    return _file_response(data, f"{_stem(pdf_id, pdf_id)}_pages.zip", media_type="application/zip")
+    return _send_file(data, f"{_stem(pdf_id, pdf_id)}_pages.zip", "application/zip")
 
 
 class WatermarkRequest(PydanticBaseModel):
@@ -1258,13 +1336,13 @@ async def protect_pdf(pdf_id: str, request: ProtectRequest) -> dict:
     finally:
         doc.close()
 
-    if pdf_id in PDF_METADATA:
-        PDF_METADATA[pdf_id]["password"] = request.password
-        PDF_METADATA[pdf_id]["enc_kwargs"] = {
+    storage.update_meta(pdf_id,
+        password=request.password,
+        enc_kwargs={
             "encryption": fitz.PDF_ENCRYPT_AES_256,
             "user_pw": request.password,
             "owner_pw": request.password,
-        }
+        })
 
     return {"success": True, "size": len(data)}
 
@@ -1275,66 +1353,69 @@ async def protect_pdf(pdf_id: str, request: ProtectRequest) -> dict:
 
 @router.post("/{pdf_id}/annotations")
 async def add_annotation(pdf_id: str, annotation: AnnotationPayload):
-    if pdf_id not in PDF_STORAGE:
+    if not storage.pdf_exists(pdf_id):
         raise HTTPException(status_code=404, detail="PDF not found")
 
     annot_id = f"annot_{uuid.uuid4().hex[:8]}"
 
-    if pdf_id not in ANNOTATION_STORE:
-        ANNOTATION_STORE[pdf_id] = {}
-
+    annots = storage.get_annotations(pdf_id)
     data = annotation.model_dump()
     data["id"] = annot_id
-    ANNOTATION_STORE[pdf_id][annot_id] = data
+    annots[annot_id] = data
+    storage.put_annotations(pdf_id, annots)
 
     return {"id": annot_id, "annotation": data}
 
 
 @router.get("/{pdf_id}/annotations")
 async def get_annotations(pdf_id: str):
-    if pdf_id not in PDF_STORAGE:
+    if not storage.pdf_exists(pdf_id):
         raise HTTPException(status_code=404, detail="PDF not found")
-    return {"annotations": ANNOTATION_STORE.get(pdf_id, {})}
+    return {"annotations": storage.get_annotations(pdf_id)}
 
 
 @router.put("/{pdf_id}/annotations/{annot_id}")
 async def update_annotation(pdf_id: str, annot_id: str, payload: dict = Body(...)):
-    if pdf_id not in ANNOTATION_STORE or annot_id not in ANNOTATION_STORE[pdf_id]:
+    annots = storage.get_annotations(pdf_id)
+    if annot_id not in annots:
         raise HTTPException(status_code=404, detail="Annotation not found")
 
-    ANNOTATION_STORE[pdf_id][annot_id].update(payload)
-    return {"id": annot_id, "annotation": ANNOTATION_STORE[pdf_id][annot_id]}
+    annots[annot_id].update(payload)
+    storage.put_annotations(pdf_id, annots)
+    return {"id": annot_id, "annotation": annots[annot_id]}
 
 
 @router.delete("/{pdf_id}/annotations/{annot_id}")
 async def delete_annotation(pdf_id: str, annot_id: str):
-    if pdf_id not in ANNOTATION_STORE or annot_id not in ANNOTATION_STORE[pdf_id]:
+    annots = storage.get_annotations(pdf_id)
+    if annot_id not in annots:
         raise HTTPException(status_code=404, detail="Annotation not found")
 
-    del ANNOTATION_STORE[pdf_id][annot_id]
+    del annots[annot_id]
+    storage.put_annotations(pdf_id, annots)
     return {"success": True}
 
 
 @router.delete("/{pdf_id}/annotations")
 async def clear_annotations(pdf_id: str):
-    if pdf_id not in PDF_STORAGE:
+    if not storage.pdf_exists(pdf_id):
         raise HTTPException(status_code=404, detail="PDF not found")
 
-    ANNOTATION_STORE[pdf_id] = {}
+    storage.put_annotations(pdf_id, {})
     return {"success": True}
 
 
 @router.post("/{pdf_id}/export-annotations")
 async def export_with_annotations(pdf_id: str):
-    if pdf_id not in PDF_STORAGE:
+    if not storage.pdf_exists(pdf_id):
         raise HTTPException(status_code=404, detail="PDF not found")
 
     try:
-        doc = fitz.open(stream=PDF_STORAGE[pdf_id], filetype="pdf")
+        doc = fitz.open(stream=storage.get_pdf(pdf_id), filetype="pdf")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to open PDF: {str(e)}")
 
-    annotations = ANNOTATION_STORE.get(pdf_id, {})
+    annotations = storage.get_annotations(pdf_id)
 
     for annot_id, annot_data in annotations.items():
         page_num = annot_data.get("page", 0)
@@ -1429,18 +1510,11 @@ async def export_with_annotations(pdf_id: str):
     doc.save(output, garbage=3, deflate=True)
     doc.close()
 
-    raw_filename = PDF_METADATA.get(pdf_id, {}).get("filename", f"{pdf_id}.pdf")
+    raw_filename = storage.get_meta(pdf_id).get("filename", f"{pdf_id}.pdf")
     clean_name = raw_filename.rsplit(".", 1)[0]
     export_filename = f"{clean_name}_annotated.pdf"
 
-    return StreamingResponse(
-        io.BytesIO(output.getvalue()),
-        media_type="application/pdf",
-        headers={
-            "Content-Disposition": f'attachment; filename="{export_filename}"',
-            "Access-Control-Expose-Headers": "Content-Disposition",
-        },
-    )
+    return _send_file(output.getvalue(), export_filename, "application/pdf")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1449,17 +1523,20 @@ async def export_with_annotations(pdf_id: str):
 
 @router.get("/{pdf_id}/download")
 async def download_pdf(pdf_id: str, filename: Optional[str] = Query(None)):
-    if pdf_id not in PDF_STORAGE:
+    if not storage.pdf_exists(pdf_id):
         raise HTTPException(status_code=404, detail="PDF not found")
 
-    stored_name = PDF_METADATA.get(pdf_id, {}).get("filename", f"{pdf_id}.pdf")
+    stored_name = storage.get_meta(pdf_id).get("filename", f"{pdf_id}.pdf")
     target_filename = filename or stored_name
     if not target_filename.lower().endswith(".pdf"):
         target_filename = f"{target_filename}.pdf"
     target_filename = re.sub(r'[\\"/\r\n]', "_", target_filename).strip() or f"{pdf_id}.pdf"
 
+    direct = storage.public_url(pdf_id)
+    if direct:
+        return RedirectResponse(direct, status_code=307)
     return StreamingResponse(
-        io.BytesIO(PDF_STORAGE[pdf_id]),
+        io.BytesIO(storage.get_pdf(pdf_id)),
         media_type="application/pdf",
         headers={
             "Content-Disposition": f'attachment; filename="{target_filename}"',
@@ -1470,17 +1547,28 @@ async def download_pdf(pdf_id: str, filename: Optional[str] = Query(None)):
 
 @router.get("/{pdf_id}/info")
 async def get_pdf_info(pdf_id: str):
-    if pdf_id not in PDF_STORAGE:
+    if not storage.pdf_exists(pdf_id):
         raise HTTPException(status_code=404, detail="PDF not found")
 
-    metadata = PDF_METADATA.get(pdf_id, {})
+    metadata = storage.get_meta(pdf_id)
     return {
         "id": pdf_id,
         "filename": metadata.get("filename", f"{pdf_id}.pdf"),
         "page_count": metadata.get("page_count", 0),
-        "size": len(PDF_STORAGE[pdf_id]),
-        "annotation_count": len(ANNOTATION_STORE.get(pdf_id, {})),
+        "size": metadata.get("size", 0),
+        "annotation_count": len(storage.get_annotations(pdf_id)),
     }
+
+
+def _ocr_available() -> bool:
+    """True when the native Tesseract binary is installed (self-hosted)."""
+    import shutil
+
+    try:
+        import pytesseract  # noqa: F401
+    except ImportError:
+        return False
+    return shutil.which("tesseract") is not None
 
 
 @router.get("/health")
@@ -1488,5 +1576,7 @@ async def health():
     return {
         "status": "ok",
         "service": "DocuCraft PDF API",
-        "documents_active": len(PDF_STORAGE),
+        "documents_active": storage.count(),
+        "storage_backend": os.environ.get("STORAGE_BACKEND", "memory"),
+        "ocr_available": _ocr_available(),
     }
