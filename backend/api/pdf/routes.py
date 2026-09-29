@@ -114,7 +114,7 @@ class AnnotationType(str, Enum):
     TEXT_BOX = "text_box"
     HIGHLIGHT = "highlight"
     STICKY_NOTE = "sticky_note"
-    STAMP = "stamp"
+    IMAGE = "image"
 
 
 class Point(PydanticBaseModel):
@@ -125,7 +125,8 @@ class Point(PydanticBaseModel):
 class FreehandAnnotation(PydanticBaseModel):
     type: AnnotationType = AnnotationType.FREEHAND
     page: int
-    points: list[Point]
+    points: list[Point] = []
+    strokes: Optional[list[list[Point]]] = None
     stroke_color: tuple[float, float, float] = (0, 0, 0)
     stroke_width: float = 2.0
     opacity: float = 1.0
@@ -165,15 +166,14 @@ class StickyNoteAnnotation(PydanticBaseModel):
     color: str = "yellow"
 
 
-class StampAnnotation(PydanticBaseModel):
-    type: AnnotationType = AnnotationType.STAMP
+class ImageAnnotation(PydanticBaseModel):
+    type: AnnotationType = AnnotationType.IMAGE
     page: int
     x: float
     y: float
-    width: float = 150
-    height: float = 50
-    text: str = ""
-    color: tuple[float, float, float] = (1, 0, 0)
+    width: float = 200
+    height: float = 150
+    data_url: str = ""
 
 
 AnnotationPayload = Union[
@@ -181,7 +181,7 @@ AnnotationPayload = Union[
     TextBoxAnnotation,
     HighlightAnnotation,
     StickyNoteAnnotation,
-    StampAnnotation
+    ImageAnnotation
 ]
 
 
@@ -1282,10 +1282,19 @@ async def export_with_annotations(pdf_id: str):
 
         try:
             if annot_type == AnnotationType.FREEHAND.value:
-                raw_points = annot_data.get("points", [])
-                points = [(p["x"], p["y"]) if isinstance(p, dict) else (p.x, p.y) for p in raw_points]
-                if len(points) >= 2:
-                    ink_annot = page.add_ink_annot([points])
+                raw_strokes = annot_data.get("strokes")
+                if raw_strokes:
+                    stroke_lists = [
+                        [(p["x"], p["y"]) if isinstance(p, dict) else (p.x, p.y) for p in s]
+                        for s in raw_strokes
+                    ]
+                else:
+                    raw_points = annot_data.get("points", [])
+                    pts = [(p["x"], p["y"]) if isinstance(p, dict) else (p.x, p.y) for p in raw_points]
+                    stroke_lists = [pts] if pts else []
+                stroke_lists = [s for s in stroke_lists if len(s) >= 2]
+                if stroke_lists:
+                    ink_annot = page.add_ink_annot(stroke_lists)
                     stroke = normalize_color(annot_data.get("stroke_color", [0, 0, 0]))
                     ink_annot.set_colors(stroke=stroke)
                     ink_annot.set_border(width=float(annot_data.get("stroke_width", 2.0)))
@@ -1335,27 +1344,19 @@ async def export_with_annotations(pdf_id: str):
                 )
                 text_annot.update()
 
-            elif annot_type == AnnotationType.STAMP.value:
-                x = float(annot_data.get("x", 50))
-                y = float(annot_data.get("y", 50))
-                w = float(annot_data.get("width", 150))
-                h = float(annot_data.get("height", 50))
-                rect = fitz.Rect(x, y, x + w, y + h)
-
-                color = normalize_color(annot_data.get("color", [0.8, 0.1, 0.1]))
-                shape = page.new_shape()
-                shape.draw_rect(rect)
-                shape.finish(fill=color, color=color, width=2)
-                shape.commit()
-
-                page.insert_textbox(
-                    rect,
-                    annot_data.get("text", "STAMP"),
-                    fontsize=16,
-                    fontname="helv",
-                    color=(1.0, 1.0, 1.0),
-                    align=fitz.TEXT_ALIGN_CENTER,
-                )
+            elif annot_type == AnnotationType.IMAGE.value:
+                data_url = annot_data.get("data_url", "")
+                if "," in data_url:
+                    try:
+                        img_bytes = base64.b64decode(data_url.split(",", 1)[1])
+                    except Exception:
+                        img_bytes = b""
+                    if img_bytes:
+                        x = float(annot_data.get("x", 50))
+                        y = float(annot_data.get("y", 50))
+                        w = float(annot_data.get("width", 200))
+                        h = float(annot_data.get("height", 150))
+                        page.insert_image(fitz.Rect(x, y, x + w, y + h), stream=img_bytes)
         except Exception as e:
             print(f"Warning: Failed to render annotation {annot_id}: {e}")
             continue
