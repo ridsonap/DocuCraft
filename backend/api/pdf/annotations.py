@@ -7,7 +7,7 @@ from api.pdf.routes import (
     TextBoxAnnotation,
     HighlightAnnotation,
     StickyNoteAnnotation,
-    StampAnnotation,
+    ImageAnnotation,
     AnnotationPayload,
 )
 
@@ -18,6 +18,6 @@ __all__ = [
     "TextBoxAnnotation",
     "HighlightAnnotation",
     "StickyNoteAnnotation",
-    "StampAnnotation",
+    "ImageAnnotation",
     "AnnotationPayload",
 ]

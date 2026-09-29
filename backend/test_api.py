@@ -179,20 +179,19 @@ def test_full_pdf_workflow():
     assert res.status_code == 200, res.text
     fh_id = res.json()["id"]
 
-    # Add Stamp
-    stamp_payload = {
-        "type": "stamp",
+    # Add Image annotation (tiny 1x1 red PNG as data URL)
+    img_payload = {
+        "type": "image",
         "page": 0,
         "x": 300,
         "y": 100,
-        "width": 150,
-        "height": 50,
-        "text": "APPROVED",
-        "color": [0, 180, 0],
+        "width": 100,
+        "height": 100,
+        "data_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
     }
-    res = client.post(f"/api/pdf/{pdf_id}/annotations", json=stamp_payload)
+    res = client.post(f"/api/pdf/{pdf_id}/annotations", json=img_payload)
     assert res.status_code == 200, res.text
-    stamp_id = res.json()["id"]
+    img_id = res.json()["id"]
 
     # Add Sticky Note
     note_payload = {
@@ -213,7 +212,7 @@ def test_full_pdf_workflow():
     assert res.status_code == 200, res.text
     annots = res.json()["annotations"]
     assert len(annots) == 3
-    print(f"✓ Added 3 annotations: freehand ({fh_id}), stamp ({stamp_id}), note ({note_id})")
+    print(f"✓ Added 3 annotations: freehand ({fh_id}), image ({img_id}), note ({note_id})")
 
     # Update annotation
     res = client.put(f"/api/pdf/{pdf_id}/annotations/{note_id}", json={"text": "Updated note comment"})

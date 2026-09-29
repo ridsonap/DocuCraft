@@ -5,8 +5,8 @@ import {
   Type,
   Highlighter,
   StickyNote,
-  Stamp,
   PenTool,
+  ImagePlus,
 } from "lucide-react";
 import { AnnotationType } from "@/types/annotation";
 
@@ -28,14 +28,6 @@ const COLORS = [
   { value: "#a855f7", label: "Purple" },
 ];
 
-const STAMPS = [
-  { text: "APPROVED", color: "#16a34a" },
-  { text: "DRAFT", color: "#ea580c" },
-  { text: "CONFIDENTIAL", color: "#dc2626" },
-  { text: "REVIEWED", color: "#2563eb" },
-  { text: "VOID", color: "#64748b" },
-];
-
 export default function AnnotationToolbar({
   activeTool,
   onSelectTool,
@@ -49,7 +41,7 @@ export default function AnnotationToolbar({
     { type: AnnotationType.TEXT_BOX, icon: Type, label: "Text Box" },
     { type: AnnotationType.HIGHLIGHT, icon: Highlighter, label: "Highlight Area" },
     { type: AnnotationType.STICKY_NOTE, icon: StickyNote, label: "Sticky Note" },
-    { type: AnnotationType.STAMP, icon: Stamp, label: "Stamp" },
+    { type: AnnotationType.IMAGE, icon: ImagePlus, label: "Image" },
   ];
 
   return (
@@ -102,23 +94,6 @@ export default function AnnotationToolbar({
               style={{ backgroundColor: c.value }}
               title={c.label}
             />
-          ))}
-        </div>
-      )}
-
-      {/* Stamp Presets */}
-      {activeTool === AnnotationType.STAMP && (
-        <div className="flex items-center gap-1 px-2 border-r">
-          <span className="text-xs text-gray-500 font-medium">Preset:</span>
-          {STAMPS.map((stamp) => (
-            <button
-              key={stamp.text}
-              onClick={() => onColorChange?.(stamp.color)}
-              className="px-2 py-0.5 text-[11px] font-bold rounded border transition-colors hover:bg-gray-50"
-              style={{ borderColor: stamp.color, color: stamp.color }}
-            >
-              {stamp.text}
-            </button>
           ))}
         </div>
       )}
