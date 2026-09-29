@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useRef, useCallback } from "react";
-import { Trash2, Edit3, Check, X, MessageSquare } from "lucide-react";
+import { Trash2, Edit3, X, MessageSquare } from "lucide-react";
 import {
   Annotation,
   AnnotationType,
@@ -42,6 +42,11 @@ export default function AnnotationLayer({
 
   const svgRef = useRef<SVGSVGElement>(null);
 
+  // Ref mirror so memoized handlers always see the latest annotations
+  // (avoids the stale-closure bug where adding a 2nd annotation dropped the 1st)
+  const annotationsRef = useRef(annotations);
+  annotationsRef.current = annotations;
+
   // Filter annotations for current page (0-indexed in storage)
   const pageAnnotations = annotations.filter((a) => a.page === pageNumber - 1);
 
@@ -62,6 +67,86 @@ export default function AnnotationLayer({
       y: (e.clientY - rect.top) / scale,
     };
   };
+
+  const createAnnotation = useCallback(
+    async (type: AnnotationType, x: number, y: number, customData?: any) => {
+      const rgb = hexToRgb(activeColor);
+
+      let payload: any = {
+        type,
+        page: pageNumber - 1,
+      };
+
+      switch (type) {
+        case AnnotationType.FREEHAND:
+          payload = {
+            ...payload,
+            points: customData || [],
+            stroke_color: rgb,
+            stroke_width: 2.5,
+            opacity: 1.0,
+          };
+          break;
+        case AnnotationType.TEXT_BOX:
+          payload = {
+            ...payload,
+            x: Math.round(x),
+            y: Math.round(y),
+            width: 180,
+            height: 70,
+            text: "Double click to edit",
+            font_size: 13,
+            font_name: "helv",
+            text_color: rgb,
+            background_color: [255, 255, 255],
+          };
+          break;
+        case AnnotationType.STICKY_NOTE:
+          payload = {
+            ...payload,
+            x: Math.round(x),
+            y: Math.round(y),
+            text: "Note comment",
+            icon: "note",
+            color: "yellow",
+          };
+          break;
+        case AnnotationType.STAMP:
+          payload = {
+            ...payload,
+            x: Math.round(x),
+            y: Math.round(y),
+            width: 140,
+            height: 45,
+            text: "APPROVED",
+            color: rgb[0] === 0 && rgb[1] === 0 && rgb[2] === 0 ? [220, 38, 38] : rgb,
+          };
+          break;
+        case AnnotationType.HIGHLIGHT:
+          payload = {
+            ...payload,
+            x: Math.round(x),
+            y: Math.round(y),
+            width: Math.round(customData?.width || 120),
+            height: Math.round(customData?.height || 20),
+            color: [250, 204, 21], // Yellow
+          };
+          break;
+      }
+
+      try {
+        const result = await api.addAnnotation(pdfId, payload);
+        const newAnnotation: Annotation = {
+          ...result.annotation,
+          id: result.id,
+        } as Annotation;
+        onAnnotationsChange([...annotationsRef.current, newAnnotation]);
+      } catch (err) {
+        console.error("Failed to add annotation:", err);
+      }
+    },
+    [pdfId, pageNumber, activeColor, onAnnotationsChange]
+  );
 
   const handleMouseDown = useCallback(
     (e: React.MouseEvent) => {
@@ -84,7 +169,7 @@ export default function AnnotationLayer({
         createAnnotation(activeTool, coords.x, coords.y);
       }
     },
-    [activeTool, scale]
+    [activeTool, scale, createAnnotation]
   );
 
   const handleMouseMove = useCallback(
@@ -120,89 +205,7 @@ export default function AnnotationLayer({
     setDrawingPoints([]);
     setDragStart(null);
     setDragCurrent(null);
-  }, [isDrawing, drawingPoints, dragStart, dragCurrent, activeTool]);
-
-  const createAnnotation = async (
-    type: AnnotationType,
-    x: number,
-    y: number,
-    customData?: any
-  ) => {
-    const rgb = hexToRgb(activeColor);
-
-    let payload: any = {
-      type,
-      page: pageNumber - 1,
-    };
-
-    switch (type) {
-      case AnnotationType.FREEHAND:
-        payload = {
-          ...payload,
-          points: customData || [],
-          stroke_color: rgb,
-          stroke_width: 2.5,
-          opacity: 1.0,
-        };
-        break;
-      case AnnotationType.TEXT_BOX:
-        payload = {
-          ...payload,
-          x: Math.round(x),
-          y: Math.round(y),
-          width: 180,
-          height: 70,
-          text: "Double click to edit",
-          font_size: 13,
-          font_name: "helv",
-          text_color: rgb,
-          background_color: [255, 255, 255],
-        };
-        break;
-      case AnnotationType.STICKY_NOTE:
-        payload = {
-          ...payload,
-          x: Math.round(x),
-          y: Math.round(y),
-          text: "Note comment",
-          icon: "note",
-          color: "yellow",
-        };
-        break;
-      case AnnotationType.STAMP:
-        payload = {
-          ...payload,
-          x: Math.round(x),
-          y: Math.round(y),
-          width: 140,
-          height: 45,
-          text: "APPROVED",
-          color: rgb[0] === 0 && rgb[1] === 0 && rgb[2] === 0 ? [220, 38, 38] : rgb,
-        };
-        break;
-      case AnnotationType.HIGHLIGHT:
-        payload = {
-          ...payload,
-          x: Math.round(x),
-          y: Math.round(y),
-          width: Math.round(customData?.width || 120),
-          height: Math.round(customData?.height || 20),
-          color: [250, 204, 21], // Yellow
-        };
-        break;
-    }
-
-    try {
-      const result = await api.addAnnotation(pdfId, payload);
-      const newAnnotation: Annotation = {
-        ...result.annotation,
-        id: result.id,
-      } as Annotation;
-      onAnnotationsChange([...annotations, newAnnotation]);
-    } catch (err) {
-      console.error("Failed to add annotation:", err);
-    }
-  };
+  }, [isDrawing, drawingPoints, dragStart, dragCurrent, activeTool, createAnnotation]);
 
   const handleDelete = async (id: string, e?: React.MouseEvent) => {
     e?.stopPropagation();

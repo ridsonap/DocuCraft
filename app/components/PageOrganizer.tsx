@@ -13,7 +13,6 @@ import {
   RefreshCw,
   ArrowLeft,
   ArrowRight,
-  Layers,
 } from "lucide-react";
 
 interface PageOrganizerProps {
