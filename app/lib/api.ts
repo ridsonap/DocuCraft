@@ -30,6 +30,34 @@ async function fetchJSON<T>(url: string, options?: RequestInit): Promise<T> {
   return res.json();
 }
 
+// Download a Blob to disk and free the object URL afterwards
+export function downloadBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+// fetch() variant for endpoints that return a binary Blob
+async function fetchBlob(url: string, options?: RequestInit): Promise<Blob> {
+  const res = await fetch(`${API_BASE}${url}`, options);
+  if (!res.ok) {
+    let errorDetail = `HTTP ${res.status}`;
+    try {
+      const errJson = await res.json();
+      if (errJson && errJson.detail) errorDetail = errJson.detail;
+    } catch {
+      /* non-JSON error body — keep the HTTP status */
+    }
+    throw new Error(errorDetail);
+  }
+  return res.blob();
+}
+
 export const api = {
   // Upload
   uploadPDF: async (file: File) => {
@@ -167,11 +195,68 @@ export const api = {
   },
 
   exportWithAnnotations: async (pdfId: string) => {
-    const response = await fetch(`${API_BASE}/api/pdf/${pdfId}/export-annotations`, {
-      method: 'POST',
+    return fetchBlob(`/api/pdf/${pdfId}/export-annotations`, { method: "POST" });
+  },
+
+  // --- Tools: merge / split / compress / convert / watermark / security ---
+
+  mergePDFs: async (files: File[]) => {
+    const formData = new FormData();
+    files.forEach((f) => formData.append("files", f));
+    return fetchBlob("/api/pdf/merge", { method: "POST", body: formData });
+  },
+
+  splitPDF: async (pdfId: string, pages: number[]) => {
+    return fetchBlob(`/api/pdf/${pdfId}/split`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pages }),
     });
-    if (!response.ok) throw new Error('Export with annotations failed');
-    return response.blob();
+  },
+
+  compressPDF: async (pdfId: string, level: "low" | "medium" | "high") => {
+    return fetchJSON<{ success: boolean; original_size: number; compressed_size: number; saved_pct: number }>(
+      `/api/pdf/${pdfId}/compress`,
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ level }) }
+    );
+  },
+
+  imagesToPDF: async (files: File[]) => {
+    const formData = new FormData();
+    files.forEach((f) => formData.append("files", f));
+    return fetchBlob("/api/pdf/images-to-pdf", { method: "POST", body: formData });
+  },
+
+  exportImages: async (pdfId: string, dpi = 150) => {
+    return fetchBlob(`/api/pdf/${pdfId}/export-images?dpi=${dpi}`);
+  },
+
+  addWatermark: async (pdfId: string, payload: { text: string; opacity: number; font_size: number; angle: number }) => {
+    return fetchJSON<{ success: boolean }>(
+      `/api/pdf/${pdfId}/watermark`,
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }
+    );
+  },
+
+  addPageNumbers: async (pdfId: string, payload: { position: string; start: number; font_size: number }) => {
+    return fetchJSON<{ success: boolean }>(
+      `/api/pdf/${pdfId}/page-numbers`,
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }
+    );
+  },
+
+  protectPDF: async (pdfId: string, password: string) => {
+    return fetchJSON<{ success: boolean }>(
+      `/api/pdf/${pdfId}/protect`,
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ password }) }
+    );
+  },
+
+  unlockPDF: async (file: File, password: string) => {
+    const formData = new FormData();
+    formData.append("file", file);
+    formData.append("password", password);
+    return fetchBlob("/api/pdf/unlock", { method: "POST", body: formData });
   },
 
   // Download

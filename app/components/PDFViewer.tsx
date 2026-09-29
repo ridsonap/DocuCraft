@@ -9,7 +9,6 @@ import {
   ChevronsRight,
   ZoomIn,
   ZoomOut,
-  RotateCw,
 } from "lucide-react";
 
 // Configure PDF.js worker using self-contained local worker
@@ -36,9 +35,11 @@ export default function PDFViewer({
   onDimensionsChange,
   children,
 }: PDFViewerProps) {
-  const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const renderTaskRef = useRef<any>(null);
+  const docRef = useRef<pdfjsLib.PDFDocumentProxy | null>(null);
+  const currentPageRef = useRef(currentPage);
+  currentPageRef.current = currentPage;
 
   const [pdfDoc, setPdfDoc] = useState<pdfjsLib.PDFDocumentProxy | null>(null);
   const [totalPages, setTotalPages] = useState(0);
@@ -50,9 +51,19 @@ export default function PDFViewer({
     setInputPage(String(currentPage));
   }, [currentPage]);
 
+  // Destroy the loaded document on unmount (frees worker memory)
+  useEffect(() => {
+    return () => {
+      docRef.current?.destroy();
+      docRef.current = null;
+    };
+  }, []);
+
   // Load PDF Document
   useEffect(() => {
     if (!pdfData) {
+      docRef.current?.destroy();
+      docRef.current = null;
       setPdfDoc(null);
       setTotalPages(0);
       return;
@@ -70,11 +81,18 @@ export default function PDFViewer({
         });
 
         const doc = await loadingTask.promise;
-        if (!isCancelled) {
-          setPdfDoc(doc);
-          setTotalPages(doc.numPages);
-          onPageChange(1, doc.numPages);
+        if (isCancelled) {
+          doc.destroy();
+          return;
         }
+        // Free the previous document before swapping in the new one
+        docRef.current?.destroy();
+        docRef.current = doc;
+        setPdfDoc(doc);
+        setTotalPages(doc.numPages);
+        // Keep the user's current page (clamped) instead of jumping back to page 1
+        const safePage = Math.min(Math.max(1, currentPageRef.current), doc.numPages);
+        onPageChange(safePage, doc.numPages);
       } catch (err: any) {
         if (!isCancelled) {
           console.error("Failed to load PDF in PDFViewer:", err);
@@ -264,10 +282,7 @@ export default function PDFViewer({
       </div>
 
       {/* Main Canvas Scroll Area */}
-      <div
-        ref={containerRef}
-        className="flex-1 overflow-auto p-6 flex items-start justify-center"
-      >
+      <div className="flex-1 overflow-auto p-6 flex items-start justify-center">
         {loading ? (
           <div className="flex flex-col items-center justify-center p-12 text-gray-500">
             <div className="animate-spin h-8 w-8 border-3 border-blue-600 border-t-transparent rounded-full mb-3" />

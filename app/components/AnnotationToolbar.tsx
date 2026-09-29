@@ -7,8 +7,6 @@ import {
   StickyNote,
   Stamp,
   PenTool,
-  RotateCcw,
-  Check,
 } from "lucide-react";
 import { AnnotationType } from "@/types/annotation";
 
