@@ -2,13 +2,15 @@
 
 import io
 import os
+import re
 import uuid
 import base64
+import zipfile
 from typing import Optional, Union, Any
 from dataclasses import dataclass
 from enum import Enum
 
-from fastapi import APIRouter, UploadFile, File, HTTPException, Query, Body
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Query, Body
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel as PydanticBaseModel, Field
 
@@ -196,7 +198,8 @@ router = APIRouter(prefix="/api/pdf", tags=["PDF Operations"])
 
 @router.post("/upload")
 async def upload_pdf(file: UploadFile = File(...)) -> dict:
-    if not file.filename.lower().endswith(".pdf"):
+    filename = file.filename or ""
+    if not filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="File must be a PDF document")
 
     content = await file.read()
@@ -214,7 +217,7 @@ async def upload_pdf(file: UploadFile = File(...)) -> dict:
     PDF_STORAGE[pdf_id] = content
     PDF_METADATA[pdf_id] = {
         "id": pdf_id,
-        "filename": file.filename,
+        "filename": filename or "document.pdf",
         "page_count": page_count,
         "size": len(content),
     }
@@ -222,10 +225,161 @@ async def upload_pdf(file: UploadFile = File(...)) -> dict:
 
     return {
         "id": pdf_id,
-        "filename": file.filename,
+        "filename": filename or "document.pdf",
         "page_count": page_count,
         "size": len(content),
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SHARED HELPERS (new endpoints)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _open_stored_pdf(pdf_id: str):
+    """Open a stored PDF, authenticating with the stored password if encrypted."""
+    if pdf_id not in PDF_STORAGE:
+        raise HTTPException(status_code=404, detail="PDF document not found")
+    try:
+        doc = fitz.open(stream=PDF_STORAGE[pdf_id], filetype="pdf")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to open PDF: {str(e)}")
+    if doc.needs_pass:
+        pw = PDF_METADATA.get(pdf_id, {}).get("password")
+        if not pw or not doc.authenticate(pw):
+            doc.close()
+            raise HTTPException(status_code=401, detail="PDF is password protected")
+    return doc
+
+
+def _persist_pdf(pdf_id: str, doc, **save_kwargs) -> bytes:
+    """Save doc back into in-memory storage and refresh metadata size.
+    Re-applies stored encryption settings so mutations don't strip protection."""
+    output = io.BytesIO()
+    enc_kwargs = PDF_METADATA.get(pdf_id, {}).get("enc_kwargs", {})
+    doc.save(output, garbage=4, deflate=True, **{**enc_kwargs, **save_kwargs})
+    data = output.getvalue()
+    PDF_STORAGE[pdf_id] = data
+    if pdf_id in PDF_METADATA:
+        PDF_METADATA[pdf_id]["size"] = len(data)
+    return data
+
+
+def _file_response(data: bytes, filename: str, media_type: str = "application/pdf") -> StreamingResponse:
+    safe_name = re.sub(r'[\\"/\r\n]', "_", filename or "file.pdf").strip() or "file.pdf"
+    return StreamingResponse(
+        io.BytesIO(data),
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{safe_name}"',
+            "Access-Control-Expose-Headers": "Content-Disposition",
+        },
+    )
+
+
+def _stem(pdf_id: str, fallback: str) -> str:
+    raw = PDF_METADATA.get(pdf_id, {}).get("filename", fallback)
+    return raw.rsplit(".", 1)[0] if "." in raw else raw
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MERGE / IMAGES-TO-PDF / UNLOCK (no pdf_id)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/merge")
+async def merge_pdfs(files: list[UploadFile] = File(...)):
+    if len(files) < 2:
+        raise HTTPException(status_code=400, detail="At least 2 PDF files are required to merge")
+
+    merged = fitz.open()
+    try:
+        for f in files:
+            fname = (f.filename or "").lower()
+            if not fname.endswith(".pdf"):
+                raise HTTPException(status_code=400, detail=f"File '{f.filename}' is not a PDF")
+            content = await f.read()
+            if not content:
+                raise HTTPException(status_code=400, detail=f"File '{f.filename}' is empty")
+            try:
+                src = fitz.open(stream=content, filetype="pdf")
+            except Exception:
+                raise HTTPException(status_code=400, detail=f"File '{f.filename}' is not a valid PDF")
+            if src.needs_pass:
+                src.close()
+                raise HTTPException(status_code=400, detail=f"File '{f.filename}' is password protected")
+            merged.insert_pdf(src)
+            src.close()
+
+        output = io.BytesIO()
+        merged.save(output, garbage=4, deflate=True)
+        data = output.getvalue()
+    finally:
+        merged.close()
+
+    if not data:
+        raise HTTPException(status_code=400, detail="Merged document is empty")
+    return _file_response(data, "merged.pdf")
+
+
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff", ".tif")
+
+
+@router.post("/images-to-pdf")
+async def images_to_pdf(files: list[UploadFile] = File(...)):
+    if not files:
+        raise HTTPException(status_code=400, detail="At least 1 image file is required")
+
+    pdf = fitz.open()
+    try:
+        for f in files:
+            fname = (f.filename or "").lower()
+            if not fname.endswith(IMAGE_EXTENSIONS):
+                raise HTTPException(status_code=400, detail=f"File '{f.filename}' is not a supported image")
+            content = await f.read()
+            if not content:
+                raise HTTPException(status_code=400, detail=f"File '{f.filename}' is empty")
+            try:
+                img_doc = fitz.open(stream=content)
+                rect = img_doc[0].rect
+                img_doc.close()
+            except Exception:
+                raise HTTPException(status_code=400, detail=f"File '{f.filename}' is not a valid image")
+            page = pdf.new_page(width=rect.width, height=rect.height)
+            page.insert_image(page.rect, stream=content)
+
+        output = io.BytesIO()
+        pdf.save(output, garbage=4, deflate=True)
+        data = output.getvalue()
+    finally:
+        pdf.close()
+
+    return _file_response(data, "images.pdf")
+
+
+@router.post("/unlock")
+async def unlock_pdf(file: UploadFile = File(...), password: str = Form(...)):
+    fname = (file.filename or "document.pdf")
+    if not fname.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="File must be a PDF document")
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty PDF file uploaded")
+
+    try:
+        doc = fitz.open(stream=content, filetype="pdf")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid or corrupted PDF")
+
+    try:
+        if doc.needs_pass and not doc.authenticate(password):
+            raise HTTPException(status_code=401, detail="Incorrect password")
+        output = io.BytesIO()
+        doc.save(output, garbage=4, deflate=True)
+        data = output.getvalue()
+    finally:
+        doc.close()
+
+    stem = fname.rsplit(".", 1)[0]
+    return _file_response(data, f"{stem}_unlocked.pdf")
 
 
 @router.get("/{pdf_id}/extract-text")
@@ -723,6 +877,8 @@ async def get_page_thumbnails(pdf_id: str, size: int = Query(160)) -> dict:
 async def rotate_pages(pdf_id: str, pages: list[int], degrees: int = Query(..., ge=90, le=270)) -> dict:
     if pdf_id not in PDF_STORAGE:
         raise HTTPException(status_code=404, detail="PDF not found")
+    if degrees % 90 != 0:
+        raise HTTPException(status_code=400, detail="Degrees must be a multiple of 90")
 
     doc = fitz.open(stream=PDF_STORAGE[pdf_id], filetype="pdf")
 
@@ -735,6 +891,9 @@ async def rotate_pages(pdf_id: str, pages: list[int], degrees: int = Query(..., 
     doc.save(output, garbage=3, deflate=True)
     PDF_STORAGE[pdf_id] = output.getvalue()
     doc.close()
+
+    if pdf_id in PDF_METADATA:
+        PDF_METADATA[pdf_id]["size"] = len(PDF_STORAGE[pdf_id])
 
     return {"success": True, "rotated_pages": pages, "degrees": degrees}
 
@@ -750,9 +909,11 @@ async def delete_pages(pdf_id: str, pages: list[int]) -> dict:
         doc.close()
         raise HTTPException(status_code=400, detail="Cannot delete all pages from document")
 
+    deleted = 0
     for page_num in sorted(set(pages), reverse=True):
         if 0 <= page_num < len(doc):
             doc.delete_page(page_num)
+            deleted += 1
 
     output = io.BytesIO()
     doc.save(output, garbage=3, deflate=True)
@@ -764,7 +925,7 @@ async def delete_pages(pdf_id: str, pages: list[int]) -> dict:
         PDF_METADATA[pdf_id]["page_count"] = new_page_count
         PDF_METADATA[pdf_id]["size"] = len(PDF_STORAGE[pdf_id])
 
-    return {"success": True, "deleted": len(pages), "page_count": new_page_count}
+    return {"success": True, "deleted": deleted, "page_count": new_page_count}
 
 
 @router.post("/{pdf_id}/reorder")
@@ -790,6 +951,9 @@ async def reorder_pages(pdf_id: str, new_order: list[int]) -> dict:
     new_doc.close()
     doc.close()
 
+    if pdf_id in PDF_METADATA:
+        PDF_METADATA[pdf_id]["size"] = len(PDF_STORAGE[pdf_id])
+
     return {"success": True, "new_order": new_order}
 
 
@@ -804,7 +968,11 @@ async def insert_blank_page(
         raise HTTPException(status_code=404, detail="PDF not found")
 
     doc = fitz.open(stream=PDF_STORAGE[pdf_id], filetype="pdf")
+    if width <= 0 or height <= 0:
+        doc.close()
+        raise HTTPException(status_code=400, detail="width and height must be positive")
     pno = (after_page + 1) if after_page is not None else len(doc)
+    pno = max(0, min(pno, len(doc)))
     doc.new_page(pno=pno, width=width, height=height)
 
     output = io.BytesIO()
@@ -818,6 +986,223 @@ async def insert_blank_page(
         PDF_METADATA[pdf_id]["size"] = len(PDF_STORAGE[pdf_id])
 
     return {"success": True, "page_count": new_page_count, "inserted_at": pno}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SPLIT / COMPRESS / EXPORT IMAGES / WATERMARK / PAGE NUMBERS / PROTECT
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SplitRequest(PydanticBaseModel):
+    pages: list[int]  # 1-based page numbers
+
+
+@router.post("/{pdf_id}/split")
+async def split_pdf(pdf_id: str, request: SplitRequest):
+    doc = _open_stored_pdf(pdf_id)
+    try:
+        if not request.pages:
+            raise HTTPException(status_code=400, detail="Page list cannot be empty")
+        for p in request.pages:
+            if p < 1 or p > len(doc):
+                raise HTTPException(status_code=400, detail=f"Page {p} out of range (1-{len(doc)})")
+
+        new_doc = fitz.open()
+        try:
+            for p in request.pages:
+                new_doc.insert_pdf(doc, from_page=p - 1, to_page=p - 1)
+            output = io.BytesIO()
+            new_doc.save(output, garbage=4, deflate=True)
+            data = output.getvalue()
+        finally:
+            new_doc.close()
+    finally:
+        doc.close()
+
+    return _file_response(data, f"{_stem(pdf_id, pdf_id)}_split.pdf")
+
+
+class CompressRequest(PydanticBaseModel):
+    level: str = "medium"  # low | medium | high
+
+
+@router.post("/{pdf_id}/compress")
+async def compress_pdf(pdf_id: str, request: CompressRequest) -> dict:
+    level = (request.level or "medium").lower()
+    if level not in ("low", "medium", "high"):
+        raise HTTPException(status_code=400, detail="level must be one of: low, medium, high")
+
+    doc = _open_stored_pdf(pdf_id)
+    original_size = len(PDF_STORAGE[pdf_id])
+    try:
+        if level == "high":
+            # Downscale large images (target <=1200px) and re-encode as JPEG
+            for page in doc:
+                for img in page.get_images(full=True):
+                    xref = img[0]
+                    try:
+                        pix = fitz.Pixmap(doc, xref)
+                    except Exception:
+                        continue
+                    try:
+                        if pix.alpha or pix.n > 3:
+                            continue  # keep transparency/CMYK images as-is
+                        factor = max(2, -(-max(pix.width, pix.height) // 1200))
+                        if max(pix.width, pix.height) > 1200:
+                            pix.shrink(factor)
+                            doc.update_stream(xref, pix.tobytes("jpg", jpg_quality=65))
+                    except Exception:
+                        continue
+                    finally:
+                        pix = None
+
+        data = _persist_pdf(pdf_id, doc, clean=(level != "low"))
+    finally:
+        doc.close()
+
+    compressed_size = len(data)
+    saved_pct = round((1 - compressed_size / original_size) * 100, 2) if original_size else 0.0
+    return {
+        "success": True,
+        "level": level,
+        "original_size": original_size,
+        "compressed_size": compressed_size,
+        "saved_pct": saved_pct,
+    }
+
+
+@router.get("/{pdf_id}/export-images")
+async def export_images(pdf_id: str, dpi: int = Query(150, ge=72, le=300)):
+    doc = _open_stored_pdf(pdf_id)
+    try:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for i, page in enumerate(doc):
+                pix = page.get_pixmap(dpi=dpi)
+                zf.writestr(f"page_{i + 1:03d}.png", pix.tobytes("png"))
+        data = buf.getvalue()
+    finally:
+        doc.close()
+
+    return _file_response(data, f"{_stem(pdf_id, pdf_id)}_pages.zip", media_type="application/zip")
+
+
+class WatermarkRequest(PydanticBaseModel):
+    text: str
+    opacity: float = 0.15
+    font_size: float = 48
+    angle: float = 45
+
+
+@router.post("/{pdf_id}/watermark")
+async def add_watermark(pdf_id: str, request: WatermarkRequest) -> dict:
+    if not request.text.strip():
+        raise HTTPException(status_code=400, detail="Watermark text cannot be empty")
+    opacity = max(0.05, min(1.0, request.opacity))
+
+    doc = _open_stored_pdf(pdf_id)
+    try:
+        font = fitz.Font("helv")
+        rot = fitz.Matrix(1, 1).prerotate(request.angle)
+        fs = request.font_size
+        for page in doc:
+            rect = page.rect
+            cx, cy = rect.width / 2, rect.height / 2
+            tw_len = fitz.get_text_length(request.text, fontname="helv", fontsize=fs)
+            # Anchor text midpoint at page center; morph rotates about the anchor
+            start = fitz.Point(cx - tw_len / 2, cy + fs * 0.35)
+            tw = fitz.TextWriter(rect)
+            tw.append(start, request.text, font=font, fontsize=fs)
+            tw.write_text(
+                page,
+                color=(0.45, 0.45, 0.45),
+                opacity=opacity,
+                overlay=True,
+                morph=(fitz.Point(cx, cy), rot),
+            )
+
+        _persist_pdf(pdf_id, doc)
+    finally:
+        doc.close()
+
+    return {"success": True}
+
+
+class PageNumberRequest(PydanticBaseModel):
+    position: str = "bottom-center"  # bottom/top + left/center/right
+    start: int = 1
+    font_size: float = 10
+
+
+@router.post("/{pdf_id}/page-numbers")
+async def add_page_numbers(pdf_id: str, request: PageNumberRequest) -> dict:
+    pos = (request.position or "bottom-center").lower()
+    valid = ("bottom-left", "bottom-center", "bottom-right", "top-left", "top-center", "top-right")
+    if pos not in valid:
+        raise HTTPException(status_code=400, detail=f"position must be one of: {', '.join(valid)}")
+
+    doc = _open_stored_pdf(pdf_id)
+    try:
+        margin = 36
+        fs = request.font_size
+        for i, page in enumerate(doc):
+            rect = page.rect
+            label = str(request.start + i)
+            tw = fitz.get_text_length(label, fontname="helv", fontsize=fs)
+            vertical, horizontal = pos.split("-")
+
+            y = rect.height - margin if vertical == "bottom" else margin + fs
+            if horizontal == "left":
+                x = margin
+            elif horizontal == "right":
+                x = rect.width - margin - tw
+            else:
+                x = (rect.width - tw) / 2
+
+            page.insert_text(
+                fitz.Point(x, y),
+                label,
+                fontsize=fs,
+                fontname="helv",
+                color=(0.35, 0.35, 0.35),
+            )
+
+        _persist_pdf(pdf_id, doc)
+    finally:
+        doc.close()
+
+    return {"success": True}
+
+
+class ProtectRequest(PydanticBaseModel):
+    password: str
+
+
+@router.post("/{pdf_id}/protect")
+async def protect_pdf(pdf_id: str, request: ProtectRequest) -> dict:
+    if not request.password:
+        raise HTTPException(status_code=400, detail="Password cannot be empty")
+
+    doc = _open_stored_pdf(pdf_id)
+    try:
+        data = _persist_pdf(
+            pdf_id,
+            doc,
+            encryption=fitz.PDF_ENCRYPT_AES_256,
+            user_pw=request.password,
+            owner_pw=request.password,
+        )
+    finally:
+        doc.close()
+
+    if pdf_id in PDF_METADATA:
+        PDF_METADATA[pdf_id]["password"] = request.password
+        PDF_METADATA[pdf_id]["enc_kwargs"] = {
+            "encryption": fitz.PDF_ENCRYPT_AES_256,
+            "user_pw": request.password,
+            "owner_pw": request.password,
+        }
+
+    return {"success": True, "size": len(data)}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1006,6 +1391,7 @@ async def download_pdf(pdf_id: str, filename: Optional[str] = Query(None)):
     target_filename = filename or stored_name
     if not target_filename.lower().endswith(".pdf"):
         target_filename = f"{target_filename}.pdf"
+    target_filename = re.sub(r'[\\"/\r\n]', "_", target_filename).strip() or f"{pdf_id}.pdf"
 
     return StreamingResponse(
         io.BytesIO(PDF_STORAGE[pdf_id]),
