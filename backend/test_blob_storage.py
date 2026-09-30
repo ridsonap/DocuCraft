@@ -111,6 +111,27 @@ class TestBlobOps(unittest.TestCase):
         self.assertTrue(pathname.startswith("docucraft/results/"))
         self.assertTrue(pathname.endswith("_split.pdf"))
 
+    def test_private_store_fallback(self):
+        from vercel.blob.errors import BlobError
+        bs, client = make_storage()
+
+        def fake_put(pathname, data, **kwargs):
+            if kwargs.get("access") == "public":
+                raise BlobError(
+                    "Vercel Blob: Cannot use public access on a private store.")
+            return FakeBlob(url="https://x/private/p")
+        client.put.side_effect = fake_put
+        client.get.return_value = FakeGet(b"{}")
+
+        # put_pdf falls back to private access on a private store
+        bs.put_pdf("pdf_1", b"0123456789ABCDEF")
+        accesses = [c.kwargs["access"] for c in client.put.call_args_list]
+        self.assertEqual(accesses[0], "public")   # tried first
+        self.assertIn("private", accesses[1:])    # retried privately
+        # downloads then proxy instead of redirecting
+        self.assertIsNone(bs.public_url("pdf_1"))
+        self.assertIsNone(bs.put_result(b"d", "r.pdf", "application/pdf"))
+
     def test_annotations_roundtrip(self):
         bs, client = make_storage()
         bs.put_annotations("pdf_1", {"a1": {"type": "x"}})

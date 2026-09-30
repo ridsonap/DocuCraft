@@ -178,6 +178,37 @@ class BlobStorage(StorageBackend):
                 "cannot use STORAGE_BACKEND=blob."
             )
         self._client = BlobClient(token=token)
+        # None = not probed yet; set on first PDF/result write.
+        self._public_ok: bool | None = None
+
+    @staticmethod
+    def _is_private_store_error(exc: Exception) -> bool:
+        return "private store" in str(exc).lower()
+
+    def _put_blob(self, pathname: str, data: bytes, content_type: str):
+        """Put a blob, tolerating private-access stores.
+
+        Public access keeps downloads as plain redirects (no serverless body
+        limit). When the store is configured private, fall back to a private
+        blob; downloads then proxy through the function instead.
+        Returns the SDK's put result.
+        """
+        if self._public_ok is not False:
+            try:
+                result = self._client.put(
+                    pathname, data, access="public",
+                    content_type=content_type, overwrite=True,
+                )
+                self._public_ok = True
+                return result
+            except Exception as e:
+                if not self._is_private_store_error(e):
+                    raise
+                self._public_ok = False
+        return self._client.put(
+            pathname, data, access="private",
+            content_type=content_type, overwrite=True,
+        )
 
     # -- pathnames ----------------------------------------------------------
     def _pdf_path(self, pdf_id: str) -> str:
@@ -230,13 +261,10 @@ class BlobStorage(StorageBackend):
 
     def put_pdf(self, pdf_id: str, data: bytes) -> None:
         # Public + unguessable pathname: downloads are served as redirects,
-        # never proxied through the serverless function.
-        self._client.put(
-            self._pdf_path(pdf_id),
-            data,
-            access="public",
-            content_type="application/pdf",
-            overwrite=True,
+        # never proxied through the serverless function. Falls back to a
+        # private blob on private-access stores (downloads then proxy).
+        self._put_blob(
+            self._pdf_path(pdf_id), data, content_type="application/pdf"
         )
         meta = self.get_meta(pdf_id)
         if meta:
@@ -272,6 +300,8 @@ class BlobStorage(StorageBackend):
 
     # -- file delivery -------------------------------------------------------
     def public_url(self, pdf_id: str) -> str | None:
+        if self._public_ok is False:
+            return None  # private store: downloads proxy through the function
         return (
             f"https://{self._store_id}.public.blob.vercel-storage.com/"
             f"{self._pdf_path(pdf_id)}"
@@ -280,9 +310,9 @@ class BlobStorage(StorageBackend):
     def put_result(self, data: bytes, filename: str, media_type: str) -> str | None:
         safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in filename) or "result"
         pathname = f"{self.RESULT_PREFIX}{uuid.uuid4().hex}_{safe}"
-        result = self._client.put(
-            pathname, data, access="public", content_type=media_type, overwrite=True
-        )
+        result = self._put_blob(pathname, data, content_type=media_type)
+        if self._public_ok is False:
+            return None  # private store: caller proxies bytes instead
         return result.url
 
     def count(self) -> int:
