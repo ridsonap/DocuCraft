@@ -321,6 +321,22 @@ export default function HomePage() {
         </div>
       )}
 
+      {/* Global upload progress (editor view: shown when replacing the file) */}
+      {uploadProgress !== null && pdfId && (
+        <div className="fixed top-0 left-0 right-0 z-[60]">
+          <div className="bg-blue-600 text-white text-xs px-4 py-1.5 flex items-center justify-between shadow-md">
+            <span className="font-medium">Mengunggah dokumen...</span>
+            <span className="font-semibold tabular-nums">{uploadProgress}%</span>
+          </div>
+          <div className="h-1 bg-blue-100">
+            <div
+              className="h-full bg-blue-400 transition-all duration-150"
+              style={{ width: `${uploadProgress}%` }}
+            />
+          </div>
+        </div>
+      )}
+
       {/* Top Navbar */}
       <header className="bg-white border-b border-gray-200 px-4 py-2.5 flex items-center justify-between shadow-xs z-20">
         <div className="flex items-center gap-3">
@@ -364,7 +380,7 @@ export default function HomePage() {
             <>
               {/* Replace / Upload another */}
               <label
-                className="cursor-pointer hidden sm:flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-gray-600 hover:text-gray-900 hover:bg-gray-100 border border-gray-300 rounded-lg transition-colors"
+                className={`cursor-pointer hidden sm:flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-gray-600 hover:text-gray-900 hover:bg-gray-100 border border-gray-300 rounded-lg transition-colors ${uploadProgress !== null ? "pointer-events-none opacity-60" : ""}`}
                 title="Ganti file PDF"
               >
                 <FileUp size={14} />
