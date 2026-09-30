@@ -3,9 +3,10 @@
 // fallback to the classic multipart /upload endpoint (local dev / memory backend,
 // or when the browser cannot reach the Blob API directly).
 //
-// The Blob PUT is done with plain fetch following @vercel/blob's client protocol
+// The Blob PUT is done with plain XHR following @vercel/blob's client protocol
 // (verified against @vercel/blob@2.8.0 source): fetch a client token from our
 // backend, then PUT the file to the Blob API with the token as Bearer auth.
+// XHR (instead of fetch) is used because only it reports upload progress.
 
 export interface UploadResult {
   id: string;
@@ -14,12 +15,41 @@ export interface UploadResult {
   size: number;
 }
 
+export type ProgressCallback = (fraction: number) => void;
+
 const BLOB_API_URL = "https://vercel.com/api/blob";
 const BLOB_API_VERSION = "12";
 
 function newPdfId(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(6));
   return "pdf_" + Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// Minimal XHR wrapper: fetch() cannot report upload progress.
+function xhrSend(
+  method: string,
+  url: string,
+  headers: Record<string, string>,
+  body: XMLHttpRequestBodyInit | null,
+  onProgress?: ProgressCallback
+): Promise<{ status: number; text: string }> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open(method, url);
+    for (const [k, v] of Object.entries(headers)) xhr.setRequestHeader(k, v);
+    if (onProgress && xhr.upload) {
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) onProgress(e.loaded / e.total);
+      };
+    }
+    xhr.onload = () => resolve({ status: xhr.status, text: xhr.responseText });
+    xhr.onerror = () => reject(new TypeError("Upload network error"));
+    xhr.send(body);
+  });
+}
+
+function badStatus(status: number): boolean {
+  return status < 200 || status >= 300;
 }
 
 async function throwIfBad(res: Response, fallback: string): Promise<void> {
@@ -34,12 +64,21 @@ async function throwIfBad(res: Response, fallback: string): Promise<void> {
   throw new Error(detail);
 }
 
-async function multipartUpload(file: File): Promise<UploadResult> {
+async function multipartUpload(file: File, onProgress?: ProgressCallback): Promise<UploadResult> {
   const formData = new FormData();
   formData.append("file", file);
-  const res = await fetch("/api/pdf/upload", { method: "POST", body: formData });
-  await throwIfBad(res, `Upload failed: HTTP ${res.status}`);
-  return res.json();
+  const { status, text } = await xhrSend("POST", "/api/pdf/upload", {}, formData, onProgress);
+  if (badStatus(status)) {
+    let detail = `Upload failed: HTTP ${status}`;
+    try {
+      const j = JSON.parse(text);
+      if (j?.detail) detail = j.detail;
+    } catch {
+      /* keep fallback */
+    }
+    throw new Error(detail);
+  }
+  return JSON.parse(text);
 }
 
 async function fetchClientToken(pathname: string): Promise<{ token: string; storeId: string }> {
@@ -56,42 +95,35 @@ async function fetchClientToken(pathname: string): Promise<{ token: string; stor
   return { token: clientToken, storeId: clientToken.split("_")[3] ?? "" };
 }
 
-async function directUpload(file: File): Promise<UploadResult> {
+async function directUpload(file: File, onProgress?: ProgressCallback): Promise<UploadResult> {
   const pdfId = newPdfId();
   const pathname = `docucraft/pdfs/${pdfId}.pdf`;
 
   const { token, storeId } = await fetchClientToken(pathname);
 
-  const putBlob = (access: "public" | "private") =>
-    fetch(`${BLOB_API_URL}/?pathname=${encodeURIComponent(pathname)}`, {
-      method: "PUT",
-      body: file,
-      headers: {
-        authorization: `Bearer ${token}`,
-        "x-vercel-blob-store-id": storeId,
-        "x-api-version": BLOB_API_VERSION,
-        "x-vercel-blob-access": access,
-        "x-content-type": "application/pdf",
-      },
-    });
+  const url = `${BLOB_API_URL}/?pathname=${encodeURIComponent(pathname)}`;
+  const headers = (access: "public" | "private"): Record<string, string> => ({
+    authorization: `Bearer ${token}`,
+    "x-vercel-blob-store-id": storeId,
+    "x-api-version": BLOB_API_VERSION,
+    "x-vercel-blob-access": access,
+    "x-content-type": "application/pdf",
+  });
 
-  let putRes: Response;
+  let put: { status: number; text: string };
   try {
-    putRes = await putBlob("public");
+    put = await xhrSend("PUT", url, headers("public"), file, onProgress);
     // Private-access stores reject public blobs: retry as a private blob
     // (same client token; the token is scoped to the pathname, not access).
-    if (
-      putRes.status === 400 &&
-      (await putRes.clone().text()).toLowerCase().includes("private store")
-    ) {
-      putRes = await putBlob("private");
+    if (put.status === 400 && put.text.toLowerCase().includes("private store")) {
+      put = await xhrSend("PUT", url, headers("private"), file, onProgress);
     }
   } catch {
     // Network-level failure (browser cannot reach the Blob API directly):
     // fall back to multipart upload through our backend instead of failing.
-    return multipartUpload(file);
+    return multipartUpload(file, onProgress);
   }
-  await throwIfBad(putRes, `Blob upload failed: HTTP ${putRes.status}`);
+  if (badStatus(put.status)) throw new Error(`Blob upload failed: HTTP ${put.status}`);
 
   const regRes = await fetch("/api/pdf/register-upload", {
     method: "POST",
@@ -102,14 +134,14 @@ async function directUpload(file: File): Promise<UploadResult> {
   return regRes.json();
 }
 
-export async function uploadPDFSmart(file: File): Promise<UploadResult> {
+export async function uploadPDFSmart(file: File, onProgress?: ProgressCallback): Promise<UploadResult> {
   // Probe with a valid pathname: 501 means the memory backend (no direct upload).
   try {
     const probe = await fetchClientToken("docucraft/pdfs/pdf_000000000000.pdf");
-    if (!probe.token) return multipartUpload(file);
+    if (!probe.token) return multipartUpload(file, onProgress);
   } catch (e: any) {
-    if (/not supported/i.test(e?.message ?? "")) return multipartUpload(file);
+    if (/not supported/i.test(e?.message ?? "")) return multipartUpload(file, onProgress);
     throw e;
   }
-  return directUpload(file);
+  return directUpload(file, onProgress);
 }

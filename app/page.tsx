@@ -41,7 +41,7 @@ export default function HomePage() {
   const [currentPage, setCurrentPage] = useState(1);
   const [totalPages, setTotalPages] = useState(0);
   const [scale, setScale] = useState(1.25);
-  const [loading, setLoading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<number | null>(null);
   const [toastMessage, setToastMessage] = useState<{ text: string; type: "success" | "error" | "info" } | null>(null);
 
   // Text edit state
@@ -116,11 +116,11 @@ export default function HomePage() {
       return;
     }
 
-    setLoading(true);
+    setUploadProgress(0);
     try {
       const data = await file.arrayBuffer();
       const { uploadPDFSmart } = await import("@/lib/blobUpload");
-      const result = await uploadPDFSmart(file);
+      const result = await uploadPDFSmart(file, (f) => setUploadProgress(Math.round(f * 100)));
 
       setPdfData(data);
       setPdfId(result.id);
@@ -136,7 +136,7 @@ export default function HomePage() {
       console.error("Upload failed:", err);
       showToast(err?.message || "Gagal mengunggah PDF. Pastikan backend aktif!", "error");
     } finally {
-      setLoading(false);
+      setUploadProgress(null);
     }
   };
 
@@ -718,7 +718,7 @@ export default function HomePage() {
               Edit teks langsung, atur dan putar halaman, bubuhkan tanda tangan digital, buat catatan, dan scan OCR dalam satu aplikasi web cepat & modern.
             </p>
 
-            <label className="cursor-pointer inline-flex items-center gap-2.5 px-6 py-3 bg-blue-600 hover:bg-blue-700 text-white font-semibold text-sm rounded-xl shadow-md transition-all hover:shadow-lg active:scale-98">
+            <label className={`cursor-pointer inline-flex items-center gap-2.5 px-6 py-3 bg-blue-600 hover:bg-blue-700 text-white font-semibold text-sm rounded-xl shadow-md transition-all hover:shadow-lg active:scale-98 ${uploadProgress !== null ? "pointer-events-none opacity-60" : ""}`}>
               <FileUp size={18} />
               Pilih Dokumen PDF
               <input
@@ -729,9 +729,24 @@ export default function HomePage() {
               />
             </label>
 
-            <p className="text-xs text-gray-400 mt-4">
-              atau seret &amp; letakkan file PDF di sini
-            </p>
+            {uploadProgress !== null ? (
+              <div className="mt-6 text-left">
+                <div className="flex justify-between text-xs text-gray-600 mb-1.5">
+                  <span>Mengunggah dokumen...</span>
+                  <span className="font-semibold tabular-nums">{uploadProgress}%</span>
+                </div>
+                <div className="h-2.5 bg-gray-100 rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-blue-600 rounded-full transition-all duration-150"
+                    style={{ width: `${uploadProgress}%` }}
+                  />
+                </div>
+              </div>
+            ) : (
+              <p className="text-xs text-gray-400 mt-4">
+                atau seret &amp; letakkan file PDF di sini
+              </p>
+            )}
 
             <div className="grid grid-cols-3 gap-4 mt-10 pt-8 border-t border-gray-100 text-left">
               <div>
