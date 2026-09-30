@@ -1,6 +1,7 @@
 // Smart PDF upload: direct browser → Vercel Blob when the backend supports it
 // (bypasses the ~4.5 MB serverless request body limit), with transparent
-// fallback to the classic multipart /upload endpoint (local dev / memory backend).
+// fallback to the classic multipart /upload endpoint (local dev / memory backend,
+// or when the browser cannot reach the Blob API directly).
 //
 // The Blob PUT is done with plain fetch following @vercel/blob's client protocol
 // (verified against @vercel/blob@2.8.0 source): fetch a client token from our
@@ -74,14 +75,21 @@ async function directUpload(file: File): Promise<UploadResult> {
       },
     });
 
-  let putRes = await putBlob("public");
-  // Private-access stores reject public blobs: retry as a private blob
-  // (same client token; the token is scoped to the pathname, not access).
-  if (
-    putRes.status === 400 &&
-    (await putRes.clone().text()).toLowerCase().includes("private store")
-  ) {
-    putRes = await putBlob("private");
+  let putRes: Response;
+  try {
+    putRes = await putBlob("public");
+    // Private-access stores reject public blobs: retry as a private blob
+    // (same client token; the token is scoped to the pathname, not access).
+    if (
+      putRes.status === 400 &&
+      (await putRes.clone().text()).toLowerCase().includes("private store")
+    ) {
+      putRes = await putBlob("private");
+    }
+  } catch {
+    // Network-level failure (browser cannot reach the Blob API directly):
+    // fall back to multipart upload through our backend instead of failing.
+    return multipartUpload(file);
   }
   await throwIfBad(putRes, `Blob upload failed: HTTP ${putRes.status}`);
 
