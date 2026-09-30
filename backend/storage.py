@@ -178,8 +178,26 @@ class BlobStorage(StorageBackend):
                 "cannot use STORAGE_BACKEND=blob."
             )
         self._client = BlobClient(token=token)
-        # None = not probed yet; set on first PDF/result write.
+        # None = not probed yet; set on first PDF/result write or access probe.
         self._public_ok: bool | None = None
+
+    def _probe_access_mode(self) -> None:
+        """Best-effort probe of whether this store allows public blobs.
+
+        Cold function instances never performed a write, so _public_ok is
+        still None; without a probe public_url() would optimistically
+        redirect to a public URL that 404s on private-access stores.
+        Never raises: on unexpected failure the previous behavior is kept.
+        """
+        probe = f"{self.RESULT_PREFIX}_access_probe"
+        try:
+            self._put_blob(probe, b"probe", content_type="text/plain")
+        except Exception:
+            return
+        try:
+            self._client.delete([probe])
+        except Exception:
+            pass
 
     @staticmethod
     def _is_private_store_error(exc: Exception) -> bool:
@@ -300,6 +318,8 @@ class BlobStorage(StorageBackend):
 
     # -- file delivery -------------------------------------------------------
     def public_url(self, pdf_id: str) -> str | None:
+        if self._public_ok is None:
+            self._probe_access_mode()
         if self._public_ok is False:
             return None  # private store: downloads proxy through the function
         return (

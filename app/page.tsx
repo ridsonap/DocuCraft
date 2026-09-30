@@ -109,10 +109,12 @@ export default function HomePage() {
     }
   }, [pdfId, currentPage, activeTab]);
 
-  // Handle file upload
-  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
+  // Handle file upload (shared by the file picker and drag-and-drop)
+  const uploadFile = async (file: File) => {
+    if (!file.name.toLowerCase().endsWith(".pdf")) {
+      showToast("File harus berformat PDF (.pdf)", "error");
+      return;
+    }
 
     setLoading(true);
     try {
@@ -135,8 +137,22 @@ export default function HomePage() {
       showToast(err?.message || "Gagal mengunggah PDF. Pastikan backend aktif!", "error");
     } finally {
       setLoading(false);
-      if (fileInputRef.current) fileInputRef.current.value = "";
     }
+  };
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (file) await uploadFile(file);
+  };
+
+  // Drag-and-drop onto the landing card
+  const [isDragging, setIsDragging] = useState(false);
+  const handleDrop = async (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+    const file = e.dataTransfer.files?.[0];
+    if (file) await uploadFile(file);
   };
 
   // Refresh PDF bytes after an in-place tool modified the document
@@ -678,7 +694,19 @@ export default function HomePage() {
       ) : (
         /* Empty Welcome State: Upload prompt */
         <main className="flex-1 flex items-center justify-center p-6 bg-slate-50">
-          <div className="text-center max-w-lg bg-white p-10 rounded-3xl shadow-sm border border-gray-200">
+          <div
+            onDragOver={(e) => {
+              e.preventDefault();
+              setIsDragging(true);
+            }}
+            onDragLeave={() => setIsDragging(false)}
+            onDrop={handleDrop}
+            className={`text-center max-w-lg bg-white p-10 rounded-3xl shadow-sm border transition-all ${
+              isDragging
+                ? "border-blue-500 ring-4 ring-blue-100 bg-blue-50/40 scale-[1.01]"
+                : "border-gray-200"
+            }`}
+          >
             <div className="w-20 h-20 bg-blue-50 text-blue-600 rounded-2xl flex items-center justify-center mx-auto mb-6 shadow-xs">
               <FileUp size={36} />
             </div>
@@ -700,6 +728,10 @@ export default function HomePage() {
                 className="hidden"
               />
             </label>
+
+            <p className="text-xs text-gray-400 mt-4">
+              atau seret &amp; letakkan file PDF di sini
+            </p>
 
             <div className="grid grid-cols-3 gap-4 mt-10 pt-8 border-t border-gray-100 text-left">
               <div>

@@ -60,17 +60,29 @@ async function directUpload(file: File): Promise<UploadResult> {
   const pathname = `docucraft/pdfs/${pdfId}.pdf`;
 
   const { token, storeId } = await fetchClientToken(pathname);
-  const putRes = await fetch(`${BLOB_API_URL}/?pathname=${encodeURIComponent(pathname)}`, {
-    method: "PUT",
-    body: file,
-    headers: {
-      authorization: `Bearer ${token}`,
-      "x-vercel-blob-store-id": storeId,
-      "x-api-version": BLOB_API_VERSION,
-      "x-vercel-blob-access": "public",
-      "x-content-type": "application/pdf",
-    },
-  });
+
+  const putBlob = (access: "public" | "private") =>
+    fetch(`${BLOB_API_URL}/?pathname=${encodeURIComponent(pathname)}`, {
+      method: "PUT",
+      body: file,
+      headers: {
+        authorization: `Bearer ${token}`,
+        "x-vercel-blob-store-id": storeId,
+        "x-api-version": BLOB_API_VERSION,
+        "x-vercel-blob-access": access,
+        "x-content-type": "application/pdf",
+      },
+    });
+
+  let putRes = await putBlob("public");
+  // Private-access stores reject public blobs: retry as a private blob
+  // (same client token; the token is scoped to the pathname, not access).
+  if (
+    putRes.status === 400 &&
+    (await putRes.clone().text()).toLowerCase().includes("private store")
+  ) {
+    putRes = await putBlob("private");
+  }
   await throwIfBad(putRes, `Blob upload failed: HTTP ${putRes.status}`);
 
   const regRes = await fetch("/api/pdf/register-upload", {
